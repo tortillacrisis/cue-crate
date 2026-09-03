@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en" data-page="mobile">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#141310">
+    <title>Cue Crate · Phone companion</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body class="mobile-body">
+    <main class="mobile-page">
+      <header class="mobile-header">
+        <a class="app-brand" href="mobile.html"><span class="brand-mark" aria-hidden="true">◒</span><span>Cue Crate</span></a>
+        <span id="owner" class="chip">Connecting…</span>
+      </header>
+
+      <section class="mobile-hero" aria-labelledby="page-title">
+        <p class="eyebrow">Phone companion</p>
+        <h1 id="page-title">Capture the record clearly.</h1>
+        <p>Take one photo per view. Front, back, label, and an optional barcode close-up stay together as one local intake bundle.</p>
+      </section>
+
+      <section class="mobile-panel surface" aria-labelledby="intake-title">
+        <div class="mobile-panel-heading"><div><p class="section-label">New intake</p><h2 id="intake-title">Photo bundle</h2></div><span id="upload-id-label" class="summary">A new bundle is created on upload.</span></div>
+        <div class="mobile-photo-grid">
+          <label class="mobile-photo mobile-photo--required"><span>01 · Primary evidence</span><small>Required: back cover with title, catalogue number, and barcode if present.</small><input data-role="evidence" type="file" accept="image/*"></label>
+          <label class="mobile-photo"><span>02 · Label · optional</span><small>Centre label or sticker if the primary photo is ambiguous.</small><input data-role="label" type="file" accept="image/*"></label>
+          <label class="mobile-photo"><span>03 · Front · optional</span><small>Front cover for additional artwork and title context.</small><input data-role="front" type="file" accept="image/*"></label>
+          <label class="mobile-photo"><span>04 · Barcode · optional</span><small>Close-up of the bars and the complete number printed directly underneath.</small><input data-role="barcode" type="file" accept="image/*"></label>
+        </div>
+        <button id="upload" class="button--primary mobile-submit" type="button">Upload selected photos</button>
+        <p id="upload-status" class="notice" role="status"></p>
+      </section>
+
+      <section class="mobile-panel surface" aria-labelledby="intake-queue-title">
+        <div class="mobile-panel-heading"><div><p class="section-label">Local inbox</p><h2 id="intake-queue-title">Recent bundles</h2></div><span id="intake-count" class="summary"></span></div>
+        <div id="intake-list" class="mobile-list"><p class="summary">Loading…</p></div>
+      </section>
+
+      <section class="mobile-panel surface" aria-labelledby="catalog-title">
+        <div class="mobile-panel-heading"><div><p class="section-label">Reference</p><h2 id="catalog-title">Catalogue</h2></div><span id="catalog-count" class="summary"></span></div>
+        <input id="catalog-search" class="search-field mobile-search" type="search" placeholder="Search artist or title…" autocomplete="off">
+        <div id="catalog-list" class="mobile-list"><p class="summary">Loading…</p></div>
+      </section>
+    </main>
+    <script>
+      const $ = selector => document.querySelector(selector);
+      const escape = value => String(value ?? '').replace(/[&<>'"]/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[character]));
+      const token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+      let session, records = [], uploads = [];
+      const api = (path, options = {}) => {
+        const headers = new Headers(options.headers || {});
+        headers.set('X-Cue-Crate-Session', token);
+        return fetch(path, {...options, headers});
+      };
+      const makeUploadId = () => {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+        return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+      };
+      const dateLabel = value => value ? new Date(value).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'}) : 'Just now';
+      function showError(error) { $('#upload-status').textContent = error.message; }
+      async function loadSession() {
+        if (!token) throw new Error('This phone link has no session token. Scan a fresh QR code.');
+        const response = await api('/api/mobile/session');
+        if (!response.ok) throw new Error('This phone link has expired. Scan a fresh QR code.');
+        session = await response.json();
+        $('#owner').textContent = session.owner;
+        await Promise.all([loadIntake(), loadCatalog()]);
+      }
+      async function loadIntake() {
+        const response = await api('/api/mobile/intake');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not load intake.');
+        uploads = data.uploads || [];
+        $('#intake-count').textContent = `${uploads.length} bundle${uploads.length === 1 ? '' : 's'}`;
+        $('#intake-list').innerHTML = uploads.length ? uploads.slice(0, 12).map(upload => `<div class="mobile-list-row"><div><strong>${escape(upload.upload_id)}</strong><small>${escape(dateLabel(upload.updated_at || upload.created_at))}</small></div><span class="badge badge--info">${Object.keys(upload.files || {}).length} view${Object.keys(upload.files || {}).length === 1 ? '' : 's'}</span></div>`).join('') : '<p class="summary">No phone uploads yet.</p>';
+      }
+      async function loadCatalog() {
+        const response = await api('/api/mobile/catalog');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not load catalogue.');
+        records = data.records || [];
+        $('#catalog-count').textContent = `${records.length} records`;
+        renderCatalog();
+      }
+      function renderCatalog() {
+        const query = $('#catalog-search').value.trim().toLowerCase();
+        const visible = records.filter(record => `${record.artist || ''} ${record.title || ''} ${record.label || ''}`.toLowerCase().includes(query)).slice(0, 80);
+        $('#catalog-list').innerHTML = visible.length ? visible.map(record => `<div class="mobile-list-row"><div><strong>${escape(record.artist || 'Unknown artist')} — ${escape(record.title || 'Untitled')}</strong><small>${escape([record.year, record.label, record.quick_access ? 'Quick crate' : ''].filter(Boolean).join(' · '))}</small></div>${record.quick_access ? '<span class="badge badge--accent">Quick crate</span>' : ''}</div>`).join('') : '<p class="summary">No matching records.</p>';
+      }
+      $('#upload').onclick = async () => {
+        const selected = [...document.querySelectorAll('[data-role]')].filter(input => input.files[0]);
+        if (!document.querySelector('[data-role="evidence"]').files[0]) { $('#upload-status').textContent = 'Choose the required Primary evidence photo first.'; return; }
+        try {
+          const uploadId = `${Date.now().toString(36)}-${makeUploadId().replaceAll('-', '').slice(0, 12)}`;
+          $('#upload').disabled = true; $('#upload-status').textContent = `Uploading 0/${selected.length}…`;
+          for (let index = 0; index < selected.length; index += 1) {
+            const input = selected[index]; const form = new FormData();
+            form.append('upload_id', uploadId); form.append('role', input.dataset.role); form.append('photo', input.files[0]);
+            const response = await api('/api/mobile/upload', {method: 'POST', body: form});
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Upload failed.');
+            $('#upload-status').textContent = `Uploading ${index + 1}/${selected.length}…`;
+          }
+          document.querySelectorAll('[data-role]').forEach(input => { input.value = ''; });
+          $('#upload-status').textContent = `Saved ${uploadId}.`;
+          await loadIntake();
+        } catch (error) { showError(error); }
+        finally { $('#upload').disabled = false; }
+      };
+      $('#catalog-search').addEventListener('input', renderCatalog);
+      loadSession().catch(showError);
+    </script>
+  </body>
+</html>

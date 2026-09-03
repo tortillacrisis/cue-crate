@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en" data-page="scout">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#141310">
+    <title>Cue Crate · Scout</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <header data-app-shell></header>
+    <main class="page">
+      <section class="page-header" aria-labelledby="page-title">
+        <div class="page-heading">
+          <p class="eyebrow">Collection signals</p>
+          <h1 id="page-title" class="page-title page-title--compact">Crate Scout.</h1>
+          <p id="summary" class="page-subtitle">Loading local taste profile…</p>
+        </div>
+        <label class="chip">Profile <input id="owner" aria-label="Choose profile ID" placeholder="profile-id" autocomplete="off"></label>
+      </section>
+      <section id="coverage" class="metrics"></section>
+      <p class="section-label">Signals</p>
+      <section id="signals" class="report-grid"></section>
+      <p class="section-label" style="margin-top:28px">Exploration lanes</p>
+      <section id="lanes" class="report-grid"></section>
+    </main>
+    <script src="app.js"></script>
+    <script>
+      const esc = value => { const node = document.createElement('div'); node.textContent = value ?? ''; return node.innerHTML; };
+      const coverage = document.querySelector('#coverage');
+      const signals = document.querySelector('#signals');
+      const lanes = document.querySelector('#lanes');
+      const summary = document.querySelector('#summary');
+      const owner = document.querySelector('#owner');
+      const selected = new URLSearchParams(location.search).get('owner') || localStorage.getItem('cue-crate.taste-profile.owner') || localStorage.getItem('vinyl-crate.taste-profile.owner') || '';
+      owner.value = selected;
+      const list = values => values?.length ? `<ol>${values.map(value => `<li>${esc(value.name)} <small>${esc(value.count)}</small></li>`).join('')}</ol>` : '<p class="summary">No data yet.</p>';
+      async function load() {
+        const profileOwner = owner.value;
+        if (!profileOwner) {
+          summary.textContent = 'Enter a local profile ID to view its taste profile.';
+          coverage.innerHTML = ''; signals.innerHTML = ''; lanes.innerHTML = '';
+          return;
+        }
+        summary.textContent = 'Loading local taste profile…'; coverage.innerHTML = ''; signals.innerHTML = ''; lanes.innerHTML = '';
+        try {
+          const response = await fetch(`data/reports/${encodeURIComponent(profileOwner)}/taste-profile.json`);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const profile = await response.json(); const c = profile.coverage;
+          summary.textContent = `${profile.owner}'s local profile · ${c.feature_records} verified releases · ${c.quick_crate_records} quick-crate titles · ${c.wantlist_records} Wantlist releases`;
+          coverage.innerHTML = [['Verified releases', c.feature_records], ['Quick crate', c.quick_crate_records], ['Wantlist', c.wantlist_records]].map(([label, value]) => `<article class="surface metric"><div class="metric__value">${esc(value)}</div><p class="metric__label">${esc(label)}</p></article>`).join('');
+          signals.innerHTML = [['Styles', profile.signals.styles], ['Genres', profile.signals.genres], ['Labels', profile.signals.labels], ['Quick-crate artists', profile.signals.quick_crate_artists], ['Wantlist styles', profile.signals.wantlist_styles]].map(([label, values]) => `<article class="surface report-card"><h3>${esc(label)}</h3>${list(values)}</article>`).join('');
+          lanes.innerHTML = profile.discovery_lanes.map(lane => `<article class="surface report-card"><span class="badge badge--info">${esc(lane.years)}</span><h3 style="margin-top:12px">${esc(lane.name)}</h3><p class="summary">${esc(lane.hints.join(' · '))}</p></article>`).join('');
+        } catch (error) {
+          summary.textContent = `No profile is available for ${profileOwner} yet.`;
+          coverage.innerHTML = `<div class="empty-state"><div><strong>Build a local taste profile first.</strong>Run <code>python3 cue_crate.py build-taste-profile --owner ${esc(profileOwner)}</code>.</div></div>`;
+          console.error(error);
+        }
+      }
+      owner.addEventListener('change', () => { localStorage.setItem('cue-crate.taste-profile.owner', owner.value); history.replaceState({}, '', `?owner=${encodeURIComponent(owner.value)}`); load(); });
+      load();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en" data-page="library">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#141310">
+    <title>Cue Crate · Library</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <header data-app-shell></header>
+    <main class="page">
+      <section class="page-header" aria-labelledby="page-title">
+        <div class="page-heading">
+          <p class="eyebrow">Shared collection</p>
+          <h1 id="page-title" class="page-title">The records you can reach for.</h1>
+          <p id="summary" class="page-subtitle">Loading the local catalogue…</p>
+        </div>
+        <span class="badge badge--info">Physical copies</span>
+      </section>
+
+      <section class="toolbar surface" aria-label="Library controls">
+        <label class="visually-hidden" for="search">Search the collection</label>
+        <input id="search" class="search-field" type="search" placeholder="Search artist, title, label, year…" autocomplete="off">
+        <label class="visually-hidden" for="owner">Filter by profile</label>
+        <select id="owner" aria-label="Filter by profile"><option value="">All profiles</option></select>
+        <label class="visually-hidden" for="crate">Filter by crate status</label>
+        <select id="crate" aria-label="Filter by crate status"><option value="">All records</option><option value="quick">Quick crate only</option></select>
+        <div class="review-navigation" aria-label="Choose layout">
+          <button id="grid-view" type="button" class="button--quiet" aria-pressed="true">Grid</button>
+          <button id="list-view" type="button" class="button--quiet" aria-pressed="false">List</button>
+        </div>
+      </section>
+
+      <details class="filter-drawer surface">
+        <summary>Facet filters <span id="filter-summary" class="summary">all records</span></summary>
+        <div class="filter-grid">
+          <label class="filter-control">Artists to include<select id="artist-filter" class="facet-select" multiple size="5" aria-label="Include artists"></select><small>Command/Ctrl-click for more than one.</small></label>
+          <div class="filter-control"><div class="facet-heading"><span>Genres</span><small>← exclude · neutral · include →</small></div><div id="genre-filter" class="facet-list" aria-label="Genre filters"></div></div>
+          <div class="filter-control"><div class="facet-heading"><span>Styles</span><small>← exclude · neutral · include →</small></div><div id="style-filter" class="facet-list" aria-label="Style filters"></div></div>
+          <div class="filter-control"><div class="facet-heading"><span>Formats</span><small>← exclude · neutral · include →</small></div><div id="format-filter" class="facet-list" aria-label="Format filters"></div></div>
+          <div class="filter-control"><span>Release year</span><div class="year-range"><label>From<input id="year-min" type="number" inputmode="numeric" min="1900" max="2100" placeholder="Any"></label><label>To<input id="year-max" type="number" inputmode="numeric" min="1900" max="2100" placeholder="Any"></label></div><label class="check"><input id="include-unknown" type="checkbox"> Include unknown metadata</label></div>
+        </div>
+        <div class="filter-actions"><button id="clear-filters" type="button" class="button--quiet">Clear facet filters</button><span class="summary">Each slider is independent: left excludes, centre is neutral, right includes. Multiple included values use OR logic; different facets combine with AND.</span></div>
+      </details>
+
+      <section id="grid" class="record-grid" aria-live="polite"></section>
+      <section id="message" class="empty-state" hidden></section>
+    </main>
+
+    <dialog id="record-dialog" class="dialog" aria-labelledby="dialog-title"><div id="dialog-content"></div></dialog>
+    <script src="app.js"></script>
+    <script>
+      const grid = document.querySelector('#grid');
+      const summary = document.querySelector('#summary');
+      const search = document.querySelector('#search');
+      const owner = document.querySelector('#owner');
+      const crate = document.querySelector('#crate');
+      const filterSummary = document.querySelector('#filter-summary');
+      const artistFilter = document.querySelector('#artist-filter');
+      const genreFilter = document.querySelector('#genre-filter');
+      const styleFilter = document.querySelector('#style-filter');
+      const formatFilter = document.querySelector('#format-filter');
+      const yearMin = document.querySelector('#year-min');
+      const yearMax = document.querySelector('#year-max');
+      const includeUnknown = document.querySelector('#include-unknown');
+      const clearFilters = document.querySelector('#clear-filters');
+      const message = document.querySelector('#message');
+      const dialog = document.querySelector('#record-dialog');
+      const dialogContent = document.querySelector('#dialog-content');
+      const gridView = document.querySelector('#grid-view');
+      const listView = document.querySelector('#list-view');
+      let records = [], groups = [], layout = 'grid';
+      const facetModes = {genres: new Map(), styles: new Map(), formats: new Map()};
+      const formatOptions = [['vinyl', 'Vinyl'], ['lp', 'LP'], ['12', '12″'], ['7', '7″'], ['cd', 'CD'], ['cassette', 'Cassette']];
+
+      const esc = value => { const node = document.createElement('div'); node.textContent = value ?? ''; return node.innerHTML; };
+      const cover = (record, className = 'record-cover') => record.cover_image
+        ? `<img class="${className}" src="${esc(record.cover_image)}" alt="${esc(`${record.artist} — ${record.title}`)}" loading="lazy">`
+        : `<div class="record-placeholder" aria-hidden="true">◒</div>`;
+      const recordMeta = record => [record.label, record.year, record.format, ...(record.styles || []).slice(0, 2), ...(record.crate_locations || [])].filter(Boolean).join(' · ');
+
+      function normalise(value) {
+        return String(value || '').toLocaleLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '');
+      }
+      function stringList(value) {
+        if (Array.isArray(value)) return value.map(item => String(item || '').trim()).filter(Boolean);
+        return value ? [String(value).trim()] : [];
+      }
+      function hydrateRecord(record, featureMap) {
+        const feature = featureMap[String(record.discogs_release_id)] || {};
+        const rating = feature.community?.rating?.average;
+        return {
+          ...record,
+          genres: stringList(record.genres).length ? stringList(record.genres) : stringList(feature.genres),
+          styles: stringList(record.styles).length ? stringList(record.styles) : stringList(feature.styles),
+          year: record.year || feature.year || '',
+          release_formats: stringList(record.release_formats).length ? stringList(record.release_formats) : stringList(feature.formats),
+          community_rating: record.community_rating ?? rating ?? '',
+          feature_metadata: Boolean(Object.keys(feature).length),
+        };
+      }
+      function selectedValues(select) {
+        return [...select.selectedOptions].map(option => option.value);
+      }
+      function uniqueValues(values) {
+        return [...new Map(values.filter(Boolean).map(value => [normalise(value), String(value)])).values()].sort((a, b) => a.localeCompare(b));
+      }
+      function valuesFor(select, values) {
+        select.replaceChildren(...uniqueValues(values).map(value => new Option(value, value)));
+      }
+      function modeName(value) {
+        return Number(value) < 0 ? 'exclude' : Number(value) > 0 ? 'include' : 'neutral';
+      }
+      function modeLabel(mode) {
+        return mode === 'exclude' ? 'Exclude' : mode === 'include' ? 'Include' : 'Neutral';
+      }
+      function renderFacetRows(container, facet, values) {
+        const unique = uniqueValues(values);
+        facetModes[facet] ||= new Map();
+        container.replaceChildren(...unique.map(value => {
+          const row = document.createElement('div');
+          const mode = facetModes[facet].get(value) || 'neutral';
+          row.className = 'facet-row';
+          row.dataset.mode = mode;
+          row.innerHTML = `<span class="facet-row__name">${esc(value)}</span><span class="facet-row__control"><span class="facet-row__state">${modeLabel(mode)}</span><input class="facet-slider" type="range" min="-1" max="1" step="1" value="${mode === 'exclude' ? -1 : mode === 'include' ? 1 : 0}" data-facet="${facet}" data-value="${esc(value)}" aria-label="${esc(`${modeLabel(mode)} ${value}`)}" aria-valuetext="${modeLabel(mode)}"></span>`;
+          const slider = row.querySelector('.facet-slider');
+          slider.addEventListener('input', () => {
+            const nextMode = modeName(slider.value);
+            facetModes[facet].set(value, nextMode);
+            row.dataset.mode = nextMode;
+            row.querySelector('.facet-row__state').textContent = modeLabel(nextMode);
+            slider.setAttribute('aria-label', `${modeLabel(nextMode)} ${value}`);
+            slider.setAttribute('aria-valuetext', modeLabel(nextMode));
+            render();
+          });
+          return row;
+        }));
+      }
+      function populateFacetOptions() {
+        valuesFor(artistFilter, records.map(record => record.artist));
+        const genres = records.flatMap(record => record.genres || []);
+        const styles = records.flatMap(record => record.styles || []);
+        renderFacetRows(genreFilter, 'genres', genres);
+        renderFacetRows(styleFilter, 'styles', styles);
+        renderFacetRows(formatFilter, 'formats', formatOptions.map(([, label]) => label));
+      }
+      function recordFormats(record) {
+        return [...stringList(record.release_formats), ...stringList(record.format)];
+      }
+      function formatValueMatches(record, value) {
+        const formats = recordFormats(record).join(' ').toLocaleLowerCase();
+        if (value === 'Vinyl' || value === 'vinyl') return formats.includes('vinyl');
+        if (value === 'LP' || value === 'lp') return /\blp\b/.test(formats);
+        if (value === '12″' || value === '12') return /(^|[^0-9])12(?:\"|”| inch| in)?(?:[^0-9]|$)/.test(formats);
+        if (value === '7″' || value === '7') return /(^|[^0-9])7(?:\"|”| inch| in)?(?:[^0-9]|$)/.test(formats);
+        if (value === 'CD' || value === 'cd') return /\bcd\b/.test(formats);
+        if (value === 'Cassette' || value === 'cassette') return /cassette|tape/.test(formats);
+        return false;
+      }
+      function facetCriteria(facet) {
+        const modes = facetModes[facet] || new Map();
+        return {include: [...modes].filter(([, mode]) => mode === 'include').map(([value]) => value), exclude: [...modes].filter(([, mode]) => mode === 'exclude').map(([value]) => value)};
+      }
+      function formatMatches(record, criterion) {
+        if (criterion.include.length && !criterion.include.some(value => formatValueMatches(record, value))) return false;
+        return !criterion.exclude.some(value => formatValueMatches(record, value));
+      }
+      function facetMatches(record, criterion, field) {
+        const values = stringList(record[field]);
+        const normalised = values.map(normalise);
+        if (criterion.include.length && !criterion.include.some(value => normalised.includes(normalise(value)))) return false;
+        return !criterion.exclude.some(value => normalised.includes(normalise(value)));
+      }
+      function recordSearchText(record) {
+        return [record.owner, record.artist, record.title, record.label, record.year, record.format, ...(record.genres || []), ...(record.styles || []), ...(record.crate_locations || [])].filter(Boolean).join(' ').toLocaleLowerCase();
+      }
+      function filterState() {
+        return {
+          artists: selectedValues(artistFilter),
+          genres: facetCriteria('genres'),
+          styles: facetCriteria('styles'),
+          formats: facetCriteria('formats'),
+          minYear: Number(yearMin.value) || null, maxYear: Number(yearMax.value) || null, includeUnknown: includeUnknown.checked,
+        };
+      }
+      function matchesRecord(record, filters, query) {
+        if (owner.value && record.owner !== owner.value) return false;
+        if (crate.value === 'quick' && !record.quick_access) return false;
+        if (query && !recordSearchText(record).includes(query)) return false;
+        if (filters.artists.length && !filters.artists.some(value => normalise(value) === normalise(record.artist))) return false;
+        if (!facetMatches(record, filters.genres, 'genres')) return false;
+        if (!facetMatches(record, filters.styles, 'styles')) return false;
+        if (!formatMatches(record, filters.formats)) return false;
+        if (filters.minYear || filters.maxYear) {
+          const year = Number(record.year) || null;
+          if (!year && !filters.includeUnknown) return false;
+          if (year && filters.minYear && year < filters.minYear) return false;
+          if (year && filters.maxYear && year > filters.maxYear) return false;
+        }
+        return true;
+      }
+      function updateFilterSummary(filters) {
+        const active = [];
+        if (filters.artists.length) active.push(`${filters.artists.length} artist${filters.artists.length === 1 ? '' : 's'}`);
+        if (filters.genres.include.length) active.push(`include genre: ${filters.genres.include.join(', ')}`);
+        if (filters.genres.exclude.length) active.push(`exclude genre: ${filters.genres.exclude.join(', ')}`);
+        if (filters.styles.include.length) active.push(`include style: ${filters.styles.include.join(', ')}`);
+        if (filters.styles.exclude.length) active.push(`exclude style: ${filters.styles.exclude.join(', ')}`);
+        if (filters.formats.include.length) active.push(`include format: ${filters.formats.include.join(', ')}`);
+        if (filters.formats.exclude.length) active.push(`exclude format: ${filters.formats.exclude.join(', ')}`);
+        if (filters.minYear || filters.maxYear) active.push(`years ${filters.minYear || '…'}–${filters.maxYear || '…'}`);
+        filterSummary.textContent = active.length ? active.join(' · ') : 'all records';
+      }
+      function groupRecords(items) {
+        const byTitle = new Map();
+        for (const record of items) {
+          const key = `${normalise(record.artist)}::${normalise(record.title)}`;
+          const group = byTitle.get(key) || {key, copies: [], primary: record};
+          group.copies.push(record);
+          if ((!group.primary.cover_image && record.cover_image) || (!group.primary.tracklist?.length && record.tracklist?.length)) group.primary = record;
+          byTitle.set(key, group);
+        }
+        return [...byTitle.values()].map(group => ({
+          ...group,
+          owners: [...new Set(group.copies.map(copy => copy.owner).filter(Boolean))].sort(),
+          quick: group.copies.some(copy => copy.quick_access),
+        })).sort((left, right) => `${left.primary.artist} ${left.primary.title}`.localeCompare(`${right.primary.artist} ${right.primary.title}`));
+      }
+
+      function visibleRecords() {
+        const query = search.value.trim().toLowerCase();
+        const filters = filterState();
+        updateFilterSummary(filters);
+        return groups.filter(group => group.copies.some(copy => matchesRecord(copy, filters, query)));
+      }
+
+      function render() {
+        const visible = visibleRecords();
+        const filters = filterState();
+        const query = search.value.trim().toLowerCase();
+        const quickCount = records.filter(record => record.quick_access).length;
+        summary.textContent = `${visible.length} of ${groups.length} unique titles · ${records.length} physical copies · ${quickCount} in the quick crate`;
+        grid.dataset.layout = layout;
+        grid.replaceChildren(...visible.map(group => {
+          // When a shared title has copies owned by both people, show the copy
+          // that satisfies the current filters rather than always showing the
+          // first copy that happened to enter the catalogue.
+          const record = group.copies.find(copy => matchesRecord(copy, filters, query)) || group.primary;
+          const card = document.createElement('button');
+          card.type = 'button'; card.className = 'record-card';
+          card.setAttribute('aria-label', `Open ${record.artist} — ${record.title}; ${group.copies.length} physical ${group.copies.length === 1 ? 'copy' : 'copies'}`);
+          card.innerHTML = `${cover(record)}<div class="record-details"><div class="record-kicker"><span class="chip">${esc(group.owners.join(' + ') || 'Unknown profile')}</span>${group.copies.length > 1 ? `<span class="badge badge--info">${group.copies.length} copies</span>` : ''}${group.quick ? '<span class="badge badge--accent">Quick crate</span>' : ''}</div><h2 class="record-title">${esc(record.artist || 'Unknown artist')} — ${esc(record.title || 'Untitled')}</h2><p class="record-meta">${esc(recordMeta(record) || 'Metadata unavailable')}</p></div>`;
+          card.onclick = () => openRecord(group, record);
+          return card;
+        }));
+        if (!visible.length) grid.innerHTML = '<div class="empty-state"><div><strong>No records match these filters.</strong>Try another profile, crate status, or search term.</div></div>';
+      }
+
+      function openRecord(group, selectedRecord = group.primary) {
+        const record = selectedRecord;
+        const tracks = (record.tracklist || []).filter(track => track.title).map(track => {
+          const data = [track.bpm ? `${track.bpm} BPM` : '', track.key || '', track.duration || ''].filter(Boolean).join(' · ');
+          return `<li class="track-row"><span class="track-row__position">${esc(track.position || '—')}</span><span class="track-row__title">${esc(track.artist && track.artist !== record.artist ? `${track.artist} — ${track.title}` : track.title)}</span><span class="track-row__data">${esc(data)}</span></li>`;
+        }).join('');
+        const copies = group.copies.map(copy => `<li><span><b>${esc(copy.owner || 'Unknown profile')}</b><br><small>${esc(recordMeta(copy) || 'Metadata unavailable')}</small></span>${copy.quick_access ? '<span class="badge badge--accent">Quick crate</span>' : ''}</li>`).join('');
+        const discogs = record.discogs_url || (record.discogs_release_id ? `https://www.discogs.com/release/${record.discogs_release_id}` : '');
+        dialogContent.innerHTML = `<div class="dialog__inner">${cover(record, 'dialog__cover')}<div class="dialog__body"><div class="dialog__topline"><span class="chip">${esc(group.owners.join(' + ') || 'Unknown profile')}</span><button type="button" class="button--quiet" data-close>Close</button></div><h2 id="dialog-title" class="dialog__title">${esc(record.artist || 'Unknown artist')}<br>— ${esc(record.title || 'Untitled')}</h2><p class="dialog__meta">${esc(recordMeta(record) || 'Metadata unavailable')}<br>${record.catalog_number ? `CAT. ${esc(record.catalog_number)}` : ''}</p>${group.copies.length > 1 ? `<div class="dialog__copies"><p class="section-label">${group.copies.length} physical copies</p><ul>${copies}</ul></div>` : ''}<div class="dialog__tracks"><p class="section-label">Tracks · DJ metadata</p>${tracks ? `<ol>${tracks}</ol>` : '<p class="summary">Tracklist has not been enriched yet.</p>'}</div><div class="dialog__actions">${discogs ? `<a class="button button--primary" href="${esc(discogs)}" target="_blank" rel="noreferrer">Open Discogs ↗</a>` : ''}${group.quick ? '<span class="badge badge--accent">In the quick crate</span>' : ''}</div></div></div>`;
+        dialogContent.querySelector('[data-close]').onclick = () => dialog.close();
+        if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open', '');
+      }
+
+      function setLayout(next) {
+        layout = next;
+        gridView.setAttribute('aria-pressed', String(next === 'grid'));
+        listView.setAttribute('aria-pressed', String(next === 'list'));
+        render();
+      }
+
+      const facetControls = [artistFilter, yearMin, yearMax, includeUnknown];
+      search.addEventListener('input', render); owner.addEventListener('change', render); crate.addEventListener('change', render);
+      facetControls.forEach(control => control.addEventListener(control.tagName === 'SELECT' ? 'change' : 'input', render));
+      clearFilters.onclick = () => {
+        [...artistFilter.options].forEach(option => { option.selected = false; });
+        Object.values(facetModes).forEach(modes => modes.clear());
+        populateFacetOptions();
+        yearMin.value = ''; yearMax.value = ''; includeUnknown.checked = false; render();
+      };
+      gridView.onclick = () => setLayout('grid'); listView.onclick = () => setLayout('list');
+      dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+      const readJson = path => fetch(path).then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      });
+      Promise.all([
+        readJson('data/library/catalog.json'),
+        readJson('data/cache/discogs/release-features.json').catch(() => ({features: {}})),
+      ]).then(([catalogue, featureData]) => {
+        const featureMap = featureData.features || {};
+        records = (catalogue.records || []).map(record => hydrateRecord(record, featureMap));
+        groups = groupRecords(records);
+        populateFacetOptions();
+        [...new Set(records.map(record => record.owner).filter(Boolean))].sort().forEach(name => owner.add(new Option(name, name)));
+        render();
+      }).catch(error => {
+        summary.textContent = 'Catalogue unavailable'; message.hidden = false;
+        message.innerHTML = '<div><strong>Serve Cue Crate locally to open the library.</strong>Run <code>python3 -m http.server</code> from this project folder, then open this page through that server.</div>';
+        console.error(error);
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en" data-page="review">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#141310">
+    <title>Cue Crate · Photo review</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <header data-app-shell></header>
+    <main class="page">
+      <section class="page-header" aria-labelledby="page-title">
+        <div class="page-heading">
+          <p class="eyebrow">Evidence-first identification</p>
+          <h1 id="page-title" class="page-title page-title--compact">Crate review.</h1>
+          <p id="progress" class="page-subtitle">Loading local review decisions…</p>
+          <p class="summary">Retake recommended means the evidence is still ambiguous. Solid title means the artist/title is readable. Manual only means a local identification exists but an exact Discogs pressing still needs review.</p>
+        </div>
+        <div class="review-navigation">
+          <label class="chip" title="Show only items whose review decision is still unreviewed"><input id="open-only" type="checkbox" checked> Open decisions only</label>
+          <label class="chip">Evidence <select id="quality-filter" aria-label="Filter by evidence quality"><option value="all">all evidence</option><option value="retake">retake recommended</option><option value="solid">solid title</option><option value="resolved">resolved</option><option value="reviewed">reviewed decisions</option></select></label>
+          <label class="chip">Resolution <select id="resolution-filter" aria-label="Filter by identification resolution"><option value="all">all decisions</option><option value="manual">manual only</option><option value="discogs">exact Discogs selected</option><option value="collection">collection confirmed</option><option value="open">still open</option></select></label>
+          <button id="back" type="button" class="button--quiet" disabled>Previous</button>
+          <button id="next" type="button" class="button--primary">Next open</button>
+        </div>
+      </section>
+
+      <section class="review-layout">
+        <nav id="items" class="review-queue surface" aria-label="Review queue"></nav>
+        <section id="review" class="surface review-workspace" aria-live="polite">Choose a candidate.</section>
+      </section>
+    </main>
+    <script src="app.js"></script>
+    <script>
+      let review, catalog = [], activeId, flash = '', discogsResults = [], discogsSearchTimer = null, discogsSearchSerial = 0;
+      const list = document.querySelector('#items');
+      const panel = document.querySelector('#review');
+      const progress = document.querySelector('#progress');
+      const openOnly = document.querySelector('#open-only');
+      const qualityFilter = document.querySelector('#quality-filter');
+      const resolutionFilter = document.querySelector('#resolution-filter');
+      const esc = value => { const node = document.createElement('div'); node.textContent = value ?? ''; return node.innerHTML; };
+      const itemLabel = item => `${item.observed.artist || 'Unknown'} — ${item.observed.title || item.observed.visible_text || 'Unidentified'}`;
+      const workingName = item => item.manual_identification || {artist: item.observed.artist || '', title: item.observed.title || ''};
+      const hasWorkingName = item => Boolean(workingName(item).artist?.trim() || workingName(item).title?.trim());
+      const isOpen = item => item.status === 'unreviewed';
+      const hasCorrectedEvidence = item => {
+        const manual = item.manual_identification || {};
+        return Boolean(manual.artist?.trim() && manual.title?.trim() && manual.catalog_number?.trim());
+      };
+      const qualityBucket = item => {
+        if (item.status === 'needs_better_photo' || item.status === 'unmatched') return 'retake';
+        if (item.status === 'confirmed' || item.discogs_selection || hasCorrectedEvidence(item)) return 'resolved';
+        const observed = item.observed || {};
+        return String(observed.confidence || '').toLowerCase() === 'high' && observed.artist && observed.title ? 'solid' : 'retake';
+      };
+      const qualityLabel = item => ({retake: 'Retake recommended', solid: 'Solid title', resolved: 'Resolved'})[qualityBucket(item)];
+      const sourceLabel = item => item.intake_id ? 'phone intake' : '6-record photo';
+      const resolutionBucket = item => {
+        if (item.status === 'confirmed' || item.matched_record_id) return 'collection';
+        if (item.discogs_selection) return 'discogs';
+        if (item.manual_identification) return 'manual';
+        return 'open';
+      };
+      const resolutionLabel = item => ({manual: 'Manual only', discogs: 'Discogs selected', collection: 'Collection confirmed', open: 'Still open'})[resolutionBucket(item)];
+      const matchesQuality = item => qualityFilter.value === 'all' || (qualityFilter.value === 'reviewed' ? !isOpen(item) : qualityBucket(item) === qualityFilter.value);
+      const matchesResolution = item => resolutionFilter.value === 'all' || resolutionBucket(item) === resolutionFilter.value;
+      const norm = value => (value || '').toLocaleLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+      const formatMatches = result => {
+        const filter = document.querySelector('#discogs-format-filter')?.value || 'all';
+        if (filter === 'all') return true;
+        const format = String(result.format || '').toLocaleLowerCase();
+        if (filter === 'vinyl') return format.includes('vinyl');
+        if (filter === '12') return /(^|[^0-9])12(?:\"|”| inch| in)?(?:[^0-9]|$)/.test(format);
+        if (filter === '7') return /(^|[^0-9])7(?:\"|”| inch| in)?(?:[^0-9]|$)/.test(format);
+        if (filter === 'lp') return /\blp\b/.test(format);
+        if (filter === 'cd') return /\bcd\b/.test(format);
+        if (filter === 'cassette') return /cassette|tape/.test(format);
+        return true;
+      };
+
+      function renderList() {
+        const visible = review.items.filter(item => (!openOnly.checked || isOpen(item)) && matchesQuality(item) && matchesResolution(item));
+        list.replaceChildren(...visible.map(item => {
+          const button = document.createElement('button');
+          button.className = `queue-item ${isOpen(item) ? '' : 'is-done'}`;
+          button.setAttribute('aria-current', String(item.id === activeId));
+          button.innerHTML = `${esc(itemLabel(item))}<span class="queue-item__meta">${esc(`${qualityLabel(item)} · ${resolutionLabel(item)} · ${sourceLabel(item)} · ${item.photo_path.split('/').pop()} · position ${item.position}`)}</span>`;
+          button.onclick = () => moveTo(item.id);
+          return button;
+        }));
+        const confirmed = review.items.filter(item => item.status === 'confirmed').length;
+        const unresolved = review.items.filter(isOpen).length;
+        const retakes = review.items.filter(item => qualityBucket(item) === 'retake').length;
+        const solid = review.items.filter(item => qualityBucket(item) === 'solid').length;
+        const resolved = review.items.filter(item => qualityBucket(item) === 'resolved').length;
+        const manualOnly = review.items.filter(item => resolutionBucket(item) === 'manual').length;
+        progress.textContent = `${retakes} retake recommended · ${solid} solid titles · ${resolved} resolved · ${manualOnly} manual only · ${confirmed} confirmed · ${unresolved} awaiting a decision · ${review.items.length} total`;
+        document.querySelector('#back').disabled = review.items.findIndex(item => item.id === activeId) <= 0;
+        if (!visible.length) list.innerHTML = '<div class="empty-state"><div><strong>No items match this filter.</strong>Choose a different evidence-quality filter or turn off “Open only” to revisit saved decisions.</div></div>';
+      }
+      function current() { return review.items.find(item => item.id === activeId); }
+      function collectionMatches(query) {
+        const terms = norm(query).split(' ').filter(Boolean);
+        if (!terms.length) return [];
+        return catalog.filter(record => terms.every(term => norm([record.artist, record.title, record.label, record.catalog_number].join(' ')).includes(term))).slice(0, 8);
+      }
+      function renderCollectionMatches(query) {
+        const results = document.querySelector('#collection-results');
+        if (!results) return;
+        const matches = collectionMatches(query);
+        results.innerHTML = query.trim() ? (matches.length ? matches.map(match => `<div class="suggestion"><span><b>${esc(match.artist)} — ${esc(match.title)}</b><br><small>${esc([match.label, match.year].filter(Boolean).join(' · '))}</small></span><button data-manual-match="${esc(match.id)}">Confirm this copy</button></div>`).join('') : '<p class="summary">No imported copy found for that name.</p>') : '';
+        results.querySelectorAll('[data-manual-match]').forEach(button => button.onclick = () => save('confirmed', button.dataset.manualMatch));
+      }
+      function savedTruth(item) {
+        if (item.status === 'confirmed') {
+          const record = catalog.find(record => record.id === item.matched_record_id);
+          const label = record ? `${record.artist || 'Unknown artist'} — ${record.title || 'Untitled'}` : item.matched_record_id;
+          const details = record ? [record.label, record.year, record.catalog_number].filter(Boolean).join(' · ') : '';
+          const link = record?.discogs_url ? ` <a href="${esc(record.discogs_url)}" target="_blank" rel="noreferrer">Discogs ↗</a>` : '';
+          return `<div class="truth"><span class="badge badge--confirmed">Confirmed copy</span><br><strong>${esc(label)}</strong>${details ? `<br><small>${esc(details)}</small>` : ''}${link}</div>`;
+        }
+        if (item.status === 'identified_not_in_catalog') {
+          const name = [item.manual_identification?.artist, item.manual_identification?.title].filter(Boolean).join(' — ');
+          const selection = item.discogs_selection;
+          if (selection) {
+            const details = [selection.label, selection.catalog_number, selection.barcode, selection.year, selection.country, selection.format].filter(Boolean).join(' · ');
+            const link = selection.discogs_url ? ` <a href="${esc(selection.discogs_url)}" target="_blank" rel="noreferrer">Discogs ↗</a>` : '';
+            return `<div class="truth"><span class="badge badge--confirmed">Resolved · Discogs pressing selected</span><br><strong>${esc([selection.artist, selection.title].filter(Boolean).join(' — '))}</strong>${details ? `<br><small>${esc(details)}</small>` : ''}${link}<br><small>This item has left the retake queue. The selection is saved locally and has not been written to Discogs.</small><div class="review-actions"><button id="clear-discogs-selection" type="button" class="button--quiet">Clear selection</button></div></div>`;
+          }
+          if (hasCorrectedEvidence(item)) return `<div class="truth"><span class="badge badge--confirmed">Resolved · corrected evidence saved</span><br><strong>${esc(name || 'Identification saved')}</strong><br><small>Catalogue number saved locally. You can still choose an exact Discogs pressing below.</small></div>`;
+          return `<div class="truth"><span class="badge badge--review">Awaiting Discogs match</span><br><strong>${esc(name || 'Name not yet supplied')}</strong></div>`;
+        }
+        if (item.status === 'needs_better_photo') return '<div class="truth"><span class="badge badge--review">Needs evidence</span><br>Saved as needing a clearer photo.</div>';
+        if (item.status === 'unmatched') return '<div class="truth"><span class="badge badge--excluded">Unmatched</span><br>Saved without a suitable collection match.</div>';
+        return '';
+      }
+      function renderDiscogsResults() {
+        const target = document.querySelector('#discogs-results');
+        if (!target) return;
+        const tools = document.querySelector('#discogs-results-tools');
+        if (tools) tools.hidden = !discogsResults.length;
+        const visibleResults = discogsResults.map((result, index) => ({result, index})).filter(({result}) => formatMatches(result));
+        target.innerHTML = discogsResults.length ? (visibleResults.length ? visibleResults.map(({result, index}) => {
+          const image = result.cover_image ? `<img src="${esc(result.cover_image)}" alt="">` : '<div class="discogs-cover">◒</div>';
+          const link = result.discogs_url ? ` <a href="${esc(result.discogs_url)}" target="_blank" rel="noreferrer">Open ↗</a>` : '';
+          const heading = [result.artist, result.title].filter(Boolean).join(' — ') || result.title || 'Untitled';
+          const fields = [result.country, result.barcode, result.catalog_number, result.format, result.label];
+          const cells = fields.map(value => `<td>${esc(value || '—')}</td>`).join('');
+          return `<article class="discogs-result"><div class="discogs-result__cover">${image}</div><div class="discogs-result__body"><b>${esc(heading)}</b>${link}<div class="discogs-result__action"><button data-discogs-url="${esc(result.discogs_url || '')}" ${result.discogs_url ? '' : 'disabled'}>Use release URL</button></div><table class="discogs-facts"><thead><tr><th>Country</th><th>Barcode</th><th>Catalogue #</th><th>Format</th><th>Label</th></tr></thead><tbody><tr>${cells}</tr></tbody></table><small>${esc(result.year ? `Year ${result.year}` : '')}</small></div></article>`;
+        }).join('') : `<p class="summary">No candidates match the selected format filter. Try “All formats”.</p>`) : '';
+        target.querySelectorAll('[data-discogs-url]').forEach(button => button.onclick = () => {
+          const input = document.querySelector('#discogs-url');
+          if (!input || !button.dataset.discogsUrl) return;
+          input.value = button.dataset.discogsUrl;
+          input.focus();
+          input.scrollIntoView({behavior: 'smooth', block: 'center'});
+        });
+      }
+      function renderIntakeViews(item) {
+        const views = Object.entries(item.intake_views || {}).filter(([role, path]) => path && path !== item.photo_path);
+        if (!views.length) return '';
+        return `<div class="review-view-strip"><p class="section-label">Additional intake views</p><div>${views.map(([role]) => `<a href="/api/photo-view/${encodeURIComponent(item.id)}/${encodeURIComponent(role)}" target="_blank" rel="noreferrer"><img src="/api/photo-view/${encodeURIComponent(item.id)}/${encodeURIComponent(role)}" alt="${esc(role)} view"><span>${esc(role)}</span></a>`).join('')}</div></div>`;
+      }
+      function renderObservedFacts(observed) {
+        const fields = [
+          ['Artist', observed.artist], ['Title', observed.title], ['Label', observed.label],
+          ['Catalogue number (AI transcription)', observed.catalog_number], ['Barcode (AI transcription)', observed.barcode],
+          ['Country', observed.country], ['Year', observed.year], ['Format', observed.format]
+        ].filter(([, value]) => value !== undefined && value !== null && String(value).trim());
+        if (!fields.length) return '';
+        return `<dl class="evidence-facts">${fields.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl><p class="summary evidence-note">These are model transcriptions from the photos, not verified Discogs fields. Confirm the catalogue number against the label or sleeve. If the barcode is uncertain, upload a dedicated close-up showing the bars and the digits directly underneath.</p>`;
+      }
+      function identificationInputs() {
+        return {
+          artist: document.querySelector('#manual-artist')?.value.trim() || '',
+          title: document.querySelector('#manual-title')?.value.trim() || '',
+          catalog_number: document.querySelector('#manual-catalog')?.value.trim() || '',
+          barcode: document.querySelector('#manual-barcode')?.value.trim() || '',
+        };
+      }
+      function broadSearchUrl() {
+        const values = identificationInputs();
+        const item = current();
+        const observed = item?.observed || {};
+        return `https://www.discogs.com/search/?q=${encodeURIComponent([values.artist || observed.artist, values.title || observed.title, values.catalog_number, values.barcode].filter(Boolean).join(' '))}&type=release`;
+      }
+      function openBroadSearch() {
+        const url = broadSearchUrl();
+        if (url) window.open(url, '_blank', 'noopener,noreferrer');
+      }
+      function scheduleDiscogsSearch() {
+        clearTimeout(discogsSearchTimer);
+        const values = identificationInputs();
+        const button = document.querySelector('#search-discogs');
+        const target = document.querySelector('#discogs-results');
+        const hasQuery = Boolean(values.artist || values.title || values.catalog_number || values.barcode);
+        if (button) button.disabled = !hasQuery;
+        if (!hasQuery) {
+          discogsSearchSerial += 1;
+          discogsResults = [];
+          if (target) target.innerHTML = '';
+          const tools = document.querySelector('#discogs-results-tools');
+          if (tools) tools.hidden = true;
+          return;
+        }
+        discogsSearchTimer = setTimeout(() => searchDiscogs(), 650);
+      }
+      async function searchDiscogs() {
+        clearTimeout(discogsSearchTimer);
+        discogsSearchTimer = null;
+        const item = current();
+        const button = document.querySelector('#search-discogs');
+        const target = document.querySelector('#discogs-results');
+        if (!item || !button || !target) return;
+        const values = identificationInputs();
+        if (!values.artist && !values.title && !values.catalog_number && !values.barcode) { button.disabled = true; return; }
+        const serial = ++discogsSearchSerial;
+        const params = new URLSearchParams({id: item.id, ...values});
+        button.disabled = true;
+        target.innerHTML = '<p class="summary">Searching Discogs…</p>';
+        try {
+          const response = await fetch(`/api/discogs-search?${params.toString()}`);
+          const payload = await response.json().catch(() => ({}));
+          if (serial !== discogsSearchSerial) return;
+          if (!response.ok) { target.innerHTML = `<p class="summary">${esc(payload.error || 'Discogs search failed.')}</p>`; return; }
+          discogsResults = payload.results || [];
+          const tools = document.querySelector('#discogs-results-tools');
+          if (tools) tools.hidden = !discogsResults.length;
+          const basis = payload.query?.basis ? ` Discogs searched using ${payload.query.basis} when available.` : '';
+          target.innerHTML = discogsResults.length ? `<p class="summary">Results refresh as the four fields change. Compare format, label, catalogue number, country, and cover, then use the matching release URL.${esc(basis)}</p>` : '<p class="summary">No Discogs results. Correct the name or identifiers and try again.</p>';
+          if (discogsResults.length) { const heading = target.innerHTML; renderDiscogsResults(); target.insertAdjacentHTML('afterbegin', heading); }
+        } catch (error) {
+          if (serial === discogsSearchSerial) target.innerHTML = `<p class="summary">${esc(error.message || 'Discogs search failed.')}</p>`;
+        } finally {
+          if (serial === discogsSearchSerial) button.disabled = false;
+        }
+      }
+      async function chooseDiscogsUrl() {
+        const item = current();
+        const input = document.querySelector('#discogs-url');
+        const value = input.value.trim();
+        if (!value) { input.focus(); return; }
+        input.disabled = true;
+        const response = await fetch('/api/discogs-selection', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: item.id, release_url: value}) });
+        const payload = await response.json().catch(() => ({}));
+        input.disabled = false;
+        if (!response.ok) { alert(payload.error || 'Could not load this Discogs release.'); return; }
+        Object.assign(item, payload.item); discogsResults = []; flash = 'Saved — exact Discogs URL verified and selected.'; render();
+      }
+      async function clearDiscogsSelection() {
+        const item = current();
+        const response = await fetch('/api/discogs-selection', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: item.id, clear: true}) });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) { alert(payload.error || 'Could not clear this Discogs selection.'); return; }
+        Object.assign(item, payload.item); flash = payload.message; render();
+      }
+      function render() {
+        clearTimeout(discogsSearchTimer);
+        discogsSearchSerial += 1;
+        renderList(); const item = current();
+        if (!item) { panel.textContent = 'Choose a candidate.'; return; }
+        const observed = item.observed, manual = item.manual_identification || {};
+        const catalogNumber = manual.catalog_number || observed.catalog_number || '';
+        const barcode = manual.barcode || observed.barcode || '';
+        const savedMessage = flash ? `<p class="notice"><b>${esc(flash)}</b></p>` : ''; flash = '';
+        panel.innerHTML = `${savedMessage}${savedTruth(item)}<div class="review-columns"><section><p class="section-label">Observed evidence</p><h2>${esc(itemLabel(item))}</h2><p class="summary">${esc(`${item.photo_path.split('/').pop()} · grid position ${item.position} · AI confidence: ${observed.confidence || 'unknown'}`)}</p><img class="review-media" src="/api/photo/${encodeURIComponent(item.id)}" alt="Source record grid for ${esc(itemLabel(item))}">${renderIntakeViews(item)}${renderObservedFacts(observed)}<div class="evidence"><b>All visible text</b><br>${esc(observed.visible_text || 'No readable text captured.')}</div></section><section class="decision-panel"><details class="review-secondary"><summary>Collection matches <span class="summary">optional</span></summary><div class="review-section"><p class="summary">Fuzzy suggestions only. Confirm a match only when it is the exact artist and title of this physical copy.</p><div id="suggestions">${item.suggestions.length ? item.suggestions.map(match => `<div class="suggestion"><span><b>${esc(match.artist)} — ${esc(match.title)}</b><br><small>${esc([match.label, match.year].filter(Boolean).join(' · '))}</small></span><span><span class="score">${Math.round(match.score * 100)}%</span> <button data-match="${esc(match.record_id)}">Confirm this copy</button></span></div>`).join('') : '<p class="summary">No likely match in this collection.</p>'}</div></div></details><div class="review-section"><h3>Working identification</h3><p class="summary">The high-confidence answer is prefilled. Correct the name or evidence identifiers if needed, then save before choosing a Discogs pressing.</p><div class="input-pair"><label class="visually-hidden" for="manual-artist">Artist</label><input id="manual-artist" placeholder="Artist" value="${esc(manual.artist)}"><label class="visually-hidden" for="manual-title">Record title</label><input id="manual-title" placeholder="Record title" value="${esc(manual.title)}"></div><div class="input-pair"><label class="visually-hidden" for="manual-catalog">Catalogue number</label><input id="manual-catalog" placeholder="Catalogue number" value="${esc(catalogNumber)}"><label class="visually-hidden" for="manual-barcode">Barcode digits under bars</label><input id="manual-barcode" placeholder="Barcode digits under bars" value="${esc(barcode)}"></div><div id="collection-results"></div><div class="review-actions"><button id="save-manual" type="button" class="button--primary">Save identification and evidence</button></div></div><div class="review-section"><h3>Discogs release picker</h3><p class="summary">Discogs candidates load automatically from these four fields. Use the wider web search when you want to browse beyond the API results, then paste a verified release URL below.</p><div class="discogs-toolbar"><div class="discogs-toolbar__actions"><button id="search-discogs" type="button" class="button--primary" ${hasWorkingName(item) || catalogNumber || barcode ? '' : 'disabled'}>Broad search on Discogs ↗</button></div></div><div class="input-pair"><label class="visually-hidden" for="discogs-url">Exact Discogs release URL</label><input id="discogs-url" placeholder="https://www.discogs.com/release/…"><button id="use-discogs-url" type="button">Use exact URL</button></div><div id="discogs-results-tools" class="discogs-results-tools" hidden><span class="summary">Filter candidate releases</span><label class="chip">Format <select id="discogs-format-filter" aria-label="Filter Discogs candidates by format"><option value="all">all formats</option><option value="vinyl">vinyl</option><option value="12">12″</option><option value="7">7″</option><option value="lp">LP</option><option value="cd">CD</option><option value="cassette">cassette</option></select></label></div><div id="discogs-results"></div></div><div class="review-section"><h3>Other review decisions</h3><p class="summary">Use these only when the identification cannot be confirmed from the available evidence.</p><label class="visually-hidden" for="note">Optional review note</label><textarea id="note" class="textarea" placeholder="Optional note">${esc(item.note)}</textarea><div class="review-actions">${isOpen(item) ? '' : '<button class="button--quiet" data-status="unreviewed">Reopen</button>'}<button data-status="needs_better_photo">Needs better photo</button><button class="button--danger" data-status="unmatched">No match</button></div></div></section></div>`;
+        const resultTools = document.querySelector('#discogs-results-tools');
+        if (resultTools) resultTools.hidden = true;
+        panel.querySelectorAll('[data-match]').forEach(button => button.onclick = () => save('confirmed', button.dataset.match));
+        panel.querySelectorAll('[data-status]').forEach(button => button.onclick = () => save(button.dataset.status, item.matched_record_id));
+        const manualInputs = [document.querySelector('#manual-artist'), document.querySelector('#manual-title')];
+        const evidenceInputs = [document.querySelector('#manual-catalog'), document.querySelector('#manual-barcode')];
+        [...manualInputs, ...evidenceInputs].forEach(input => input.oninput = () => {
+          renderCollectionMatches(manualInputs.map(field => field.value).join(' '));
+          scheduleDiscogsSearch();
+        });
+        renderCollectionMatches(manualInputs.map(field => field.value).join(' '));
+        document.querySelector('#save-manual').onclick = () => save('identified_not_in_catalog', null, {artist: manualInputs[0].value, title: manualInputs[1].value, catalog_number: evidenceInputs[0].value, barcode: evidenceInputs[1].value}, false);
+        document.querySelector('#search-discogs').onclick = openBroadSearch;
+        document.querySelector('#discogs-format-filter').onchange = renderDiscogsResults;
+        document.querySelector('#use-discogs-url').onclick = chooseDiscogsUrl;
+        const clearSelection = document.querySelector('#clear-discogs-selection'); if (clearSelection) clearSelection.onclick = clearDiscogsSelection;
+      }
+      async function save(status, matchedRecordId, manualIdentification = null, advance = true) {
+        const item = current(); const note = document.querySelector('#note').value;
+        const response = await fetch('/api/decision', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: item.id, status, matched_record_id: matchedRecordId, manual_identification: manualIdentification, note}) });
+        if (!response.ok) { const error = await response.json().catch(() => ({})); alert(error.error || 'Could not save this decision.'); return; }
+        const changed = await response.json(); Object.assign(item, changed.item);
+        if (advance) {
+          const message = status === 'confirmed' ? 'Saved — collection copy confirmed.' : status === 'needs_better_photo' ? 'Saved — marked for a retake.' : status === 'unmatched' ? 'Saved — marked as unmatched.' : 'Saved locally.';
+          nextOpen(message);
+        } else { flash = 'Saved — corrected evidence is now resolved locally. You can still choose an exact Discogs pressing.'; render(); }
+      }
+      function moveTo(id) { activeId = id; render(); }
+      function nextOpen(message = 'Saved locally.') {
+        const start = review.items.findIndex(item => item.id === activeId);
+        const ordered = [...review.items.slice(start + 1), ...review.items.slice(0, start + 1)];
+        const next = ordered.find(item => isOpen(item) && matchesQuality(item) && matchesResolution(item)); flash = message; if (next) moveTo(next.id); else render();
+      }
+      function goBack() { const index = review.items.findIndex(item => item.id === activeId); if (index > 0) moveTo(review.items[index - 1].id); }
+      openOnly.onchange = render;
+      qualityFilter.onchange = () => { if (qualityFilter.value !== 'all') openOnly.checked = false; render(); };
+      resolutionFilter.onchange = () => { if (resolutionFilter.value !== 'all') openOnly.checked = false; render(); };
+      document.querySelector('#next').onclick = () => nextOpen(); document.querySelector('#back').onclick = goBack;
+      if (['127.0.0.1', 'localhost'].includes(location.hostname) && location.port === '8000') {
+        window.location.replace('http://127.0.0.1:8765/review.html');
+      } else {
+        Promise.all([fetch('/api/review').then(response => response.json()), fetch('/api/catalog').then(response => response.json())]).then(([reviewData, catalogData]) => { review = reviewData; catalog = catalogData.records || []; activeId = review.items.find(isOpen)?.id || review.items[0]?.id; render(); }).catch(error => { panel.textContent = `Could not load review: ${error}`; });
+      }
+    </script>
+  </body>
+</html>

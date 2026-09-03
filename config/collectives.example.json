@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "collectives": {
+    "after-hours": {
+      "display_name": "After Hours",
+      "members": [
+        {"profile_id": "dj-one", "role": "admin"},
+        {"profile_id": "dj-two", "role": "member"}
+      ],
+      "shared_locations": ["regular-bin"]
+    }
+  }
+}

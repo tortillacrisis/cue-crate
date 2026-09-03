@@ -1,0 +1,15 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.env
+client_secret*.json
+config/people.local.json
+config/profiles.local.json
+config/collectives.local.json
+imports/
+
+# Personal collection data, API responses, generated reports, and review state.
+# Keep only data/README.md in the repository as a layout guide.
+data/*
+!data/README.md

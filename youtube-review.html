@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en" data-page="playlists">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#141310">
+    <title>Cue Crate · Playlist review</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <header data-app-shell></header>
+    <main class="page">
+      <section class="page-header" aria-labelledby="page-title">
+        <div class="page-heading">
+          <p class="eyebrow">Representative track selection</p>
+          <h1 id="page-title" class="page-title page-title--compact">Playlist review.</h1>
+          <p class="page-subtitle">Choose one upload that belongs in YouTube Music, verify it there, and keep the physical crate’s listening list intentional.</p>
+          <p id="summary" class="summary">Loading local review state…</p>
+        </div>
+        <span class="badge badge--info">YouTube Music</span>
+      </section>
+
+      <section class="toolbar surface" aria-label="Playlist review controls">
+        <label class="visually-hidden" for="filter">Filter playlist candidates</label>
+        <input id="filter" class="search-field" type="search" placeholder="Filter artist, title, label…">
+        <label class="visually-hidden" for="status">Filter by review status</label>
+        <select id="status" aria-label="Filter by review status"><option value="all">All statuses</option><option value="unmatched">Needs match</option><option value="auto_selected">Auto-selected</option><option value="approved">Approved</option><option value="rejected">No suitable upload</option></select>
+        <span id="count" class="count summary"></span>
+      </section>
+      <section id="items" class="playlist-list" aria-live="polite"></section>
+    </main>
+    <script src="app.js"></script>
+    <script>
+      let review;
+      const $ = selector => document.querySelector(selector);
+      const escape = (value = '') => String(value).replace(/[&<>'"]/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[character]));
+      const statusLabel = status => ({unmatched: 'Needs match', auto_selected: 'Auto-selected', approved: 'Approved', rejected: 'No suitable upload'})[status] || status;
+      const statusClass = status => ({unmatched: 'badge--review', auto_selected: 'badge--review', approved: 'badge--confirmed', rejected: 'badge--excluded'})[status] || 'badge--info';
+      const owner = new URLSearchParams(location.search).get('owner') || '';
+      const reviewServiceOrigin = location.port === '8766' ? location.origin : 'http://127.0.0.1:8766';
+      const apiUrl = path => { const url = new URL(path, reviewServiceOrigin); if (owner) url.searchParams.set('owner', owner); return url.href; };
+      async function load() {
+        const response = await fetch(apiUrl('/api/youtube-music-review'));
+        const contentType = response.headers.get('content-type') || '';
+        if (!response.ok || !contentType.includes('application/json')) {
+          throw new Error('Playlist review needs its local owner-aware service.');
+        }
+        review = await response.json();
+        if (review.error) throw new Error(review.error); render();
+      }
+      function matches(item) {
+        const term = $('#filter').value.trim().toLowerCase(); const status = $('#status').value;
+        return (!term || [item.artist, item.title, item.label, item.year].join(' ').toLowerCase().includes(term)) && (status === 'all' || item.match_status === status);
+      }
+      function render() {
+        const items = review.items.filter(matches);
+        const approved = review.items.filter(item => item.match_status === 'approved').length;
+        const pending = review.items.filter(item => item.match_status === 'unmatched').length;
+        $('#summary').textContent = `${review.items.length} distinct owned titles · ${approved} approved · ${pending} still need a decision · publishing as ${review.account_label}`;
+        $('#count').textContent = `${items.length} shown`;
+        $('#items').innerHTML = items.length ? items.map(item => `
+          <article class="surface playlist-card status-${escape(item.match_status)}" data-id="${escape(item.id)}">
+            <div class="playlist-card__top"><div><h2>${escape(item.artist)} — ${escape(item.title)}</h2><p class="playlist-card__meta">${escape([item.year || 'year unknown', item.format || 'format unknown', item.label || 'label unknown'].join(' · '))}</p></div><span class="badge ${statusClass(item.match_status)}">${statusLabel(item.match_status)}</span></div>
+            <div class="link-list"><a href="${escape(item.youtube_search_url)}" target="_blank" rel="noreferrer">Search YouTube ↗</a><a href="${escape(item.youtube_music_search_url)}" target="_blank" rel="noreferrer">Search YouTube Music ↗</a>${item.selected_video_id ? `<a href="https://music.youtube.com/watch?v=${escape(item.selected_video_id)}" target="_blank" rel="noreferrer">Open selection in Music ↗</a>` : ''}${item.discogs_url ? `<a href="${escape(item.discogs_url)}" target="_blank" rel="noreferrer">Discogs ↗</a>` : ''}</div>
+            <div class="playlist-edit"><label class="visually-hidden">Selected YouTube URL</label><input class="video-url" value="${escape(item.selected_video_url)}" placeholder="Paste YouTube or YouTube Music video URL"><label class="visually-hidden">Review status</label><select class="match-status"><option value="unmatched" ${item.match_status==='unmatched'?'selected':''}>Needs match</option><option value="auto_selected" ${item.match_status==='auto_selected'?'selected':''}>Auto-selected — check Music</option><option value="approved" ${item.match_status==='approved'?'selected':''}>Approved</option><option value="rejected" ${item.match_status==='rejected'?'selected':''}>No suitable upload</option></select><label class="visually-hidden">Selection note</label><textarea class="note" placeholder="Optional: upload, version, or track-choice note">${escape(item.note)}</textarea></div>
+            <div class="playlist-card__verify"><label class="check"><input class="music-verified" type="checkbox" ${item.youtube_music_verified ? 'checked' : ''}> I opened this exact selection in YouTube Music and it plays there.</label></div>
+            <div class="playlist-card__actions"><button class="save button--primary" type="button">Save selection</button><span class="notice"></span></div>
+          </article>`).join('') : '<div class="empty-state"><div><strong>No tracks match those filters.</strong>Choose a different status or search term.</div></div>';
+        document.querySelectorAll('.save').forEach(button => button.addEventListener('click', save));
+      }
+      async function save(event) {
+        const card = event.currentTarget.closest('.playlist-card');
+        const item = review.items.find(entry => entry.id === card.dataset.id);
+        const notice = card.querySelector('.notice');
+        const payload = {id: item.id, selected_video_url: card.querySelector('.video-url').value, match_status: card.querySelector('.match-status').value, youtube_music_verified: card.querySelector('.music-verified').checked, note: card.querySelector('.note').value};
+        notice.textContent = 'Saving…';
+        const response = await fetch(apiUrl('/api/youtube-music-review'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({...payload, owner})});
+        const body = await response.json();
+        if (!response.ok) { notice.textContent = body.error || 'Could not save.'; return; }
+        Object.assign(item, body.item); notice.textContent = 'Saved locally.'; setTimeout(render, 280);
+      }
+      $('#filter').addEventListener('input', render); $('#status').addEventListener('change', render);
+      load().catch(error => {
+        $('#summary').textContent = error.message;
+        $('#items').innerHTML = '<div class="empty-state"><div><strong>Start the Playlist Review service, then reopen this page.</strong><p>From the project folder run:</p><code>.venv/bin/python3 cue_crate.py serve-youtube-review --owner dj-one --port 8766</code><p><a href="http://127.0.0.1:8766/youtube-review.html">Open Playlist Review ↗</a></p></div></div>';
+      });
+    </script>
+  </body>
+</html>

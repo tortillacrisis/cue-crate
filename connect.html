@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en" data-page="mobile-connect">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#141310">
+    <title>Cue Crate · Connect phone</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <main class="page connect-page">
+      <section class="page-header" aria-labelledby="page-title">
+        <div class="page-heading">
+          <p class="eyebrow">Local companion</p>
+          <h1 id="page-title" class="page-title page-title--compact">Bring the crate to your phone.</h1>
+          <p class="page-subtitle">Scan this code on the same trusted Wi‑Fi network. The phone page can capture individual record photos and browse the local catalogue.</p>
+        </div>
+        <span class="badge badge--info">LAN only</span>
+      </section>
+
+      <section class="connect-card surface">
+        <div class="connect-qr-wrap"><img id="qr" class="connect-qr" alt="QR code for Cue Crate mobile companion" hidden><div id="qr-message" class="empty-state"><div>Preparing a one-time phone link…</div></div></div>
+        <div class="connect-details">
+          <p class="section-label">Scan or open</p>
+          <p id="owner" class="connect-owner">Loading local session…</p>
+          <p id="url" class="connect-url"></p>
+          <div class="review-actions"><button id="copy" class="button--primary" type="button" disabled>Copy phone link</button><a class="button" href="viewer.html">Back to Library</a></div>
+          <p id="status" class="notice" role="status"></p>
+          <p class="summary">The link is valid only while this local server is running. Keep the server on a trusted home or studio network.</p>
+        </div>
+      </section>
+    </main>
+    <script>
+      const $ = selector => document.querySelector(selector);
+      let phoneUrl = '';
+      const token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+      const sessionHeaders = token ? {'X-Cue-Crate-Session': token} : {};
+      async function load() {
+        if (!token) throw new Error('This connect link has no session token. Restart the local mobile server and open the new link printed in the terminal.');
+        const response = await fetch('/api/mobile/session', {headers: sessionHeaders});
+        if (!response.ok) throw new Error('The mobile service could not create a session.');
+        const session = await response.json();
+        phoneUrl = session.mobile_url;
+        $('#owner').textContent = `${session.owner} · ${session.catalog_count} catalogue records`;
+        $('#url').textContent = phoneUrl;
+        const qrResponse = await fetch(session.qr_url, {headers: sessionHeaders});
+        if (!qrResponse.ok) throw new Error('The phone QR code could not be generated.');
+        $('#qr').src = URL.createObjectURL(await qrResponse.blob());
+        $('#qr').hidden = false;
+        $('#qr-message').hidden = true;
+        $('#copy').disabled = false;
+      }
+      load().catch(error => {
+        $('#qr-message').innerHTML = `<div><strong>Connection link unavailable.</strong><p>${error.message}</p><p>Make sure this page was opened from <code>serve-mobile</code>, not the static Library server.</p></div>`;
+      });
+      $('#copy').onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(phoneUrl);
+          $('#status').textContent = 'Phone link copied.';
+        } catch (error) {
+          $('#status').textContent = 'Copy was blocked; select the link above manually.';
+        }
+      };
+    </script>
+  </body>
+</html>

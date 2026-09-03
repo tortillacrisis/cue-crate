@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en" data-page="quick-crate">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#141310">
+    <title>Cue Crate · Quick crate</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <header data-app-shell></header>
+    <main class="page">
+      <section class="page-header" aria-labelledby="page-title">
+        <div class="page-heading">
+          <p class="eyebrow">Shared DJ selection</p>
+          <h1 id="page-title" class="page-title page-title--compact">The bin at your fingertips.</h1>
+          <p id="summary" class="page-subtitle">Loading reviewed selections…</p>
+        </div>
+        <span class="badge badge--accent">Quick crate</span>
+      </section>
+
+      <section class="toolbar surface" aria-label="Quick crate controls">
+        <label class="visually-hidden" for="owner">Filter quick crate by owner</label>
+        <select id="owner" aria-label="Filter quick crate by profile"><option value="">All profiles</option></select>
+        <label class="visually-hidden" for="search">Search quick crate</label>
+        <input id="search" class="search-field" type="search" placeholder="Search artist, title, label…" autocomplete="off">
+        <span id="count" class="summary"></span>
+      </section>
+
+      <section id="list" class="playlist-list" aria-live="polite"></section>
+    </main>
+    <script src="app.js"></script>
+    <script>
+      const list = document.querySelector('#list');
+      const summary = document.querySelector('#summary');
+      const count = document.querySelector('#count');
+      const search = document.querySelector('#search');
+      const owner = document.querySelector('#owner');
+      let records = [];
+      const esc = value => { const node = document.createElement('div'); node.textContent = value ?? ''; return node.innerHTML; };
+      const sourceLabel = source => ({
+        confirmed_catalog: 'Catalog match', discogs_selected: 'Discogs selected',
+        manual_identification: 'Named locally', observed_photo: 'Photo text',
+      })[source] || 'Reviewed record';
+
+      function render() {
+        const query = search.value.trim().toLowerCase();
+        const visible = records.filter(record =>
+          (!owner.value || record.owner === owner.value) &&
+          [record.artist, record.title, record.label, record.year, record.format].join(' ').toLowerCase().includes(query)
+        );
+        summary.textContent = `${records.length} reviewed physical records across the shared crate.`;
+        count.textContent = `${visible.length} shown`;
+        list.innerHTML = visible.length ? visible.map((record, index) => {
+          const meta = [record.label, record.year, record.format].filter(Boolean).join(' · ') || `${record.photo_file || 'Local source'} · position ${record.grid_position || '—'}`;
+          const label = `${record.artist || 'Unknown artist'} — ${record.title || record.visible_text || 'Unidentified'}`;
+          const tag = `<span class="badge ${record.identity_source === 'confirmed_catalog' ? 'badge--confirmed' : 'badge--info'}">${esc(sourceLabel(record.identity_source))}</span>`;
+          const inner = `<span class="record-row__index">${String(index + 1).padStart(2, '0')}</span><span><h2>${esc(label)}</h2><p>${esc(meta)}</p></span><span class="chip">${esc(record.owner || 'Unknown profile')}</span>`;
+          return record.discogs_url ? `<a class="record-row" href="${esc(record.discogs_url)}" target="_blank" rel="noreferrer" aria-label="Open ${esc(label)} on Discogs">${inner}</a>` : `<article class="record-row">${inner}</article>`;
+        }).join('') : '<div class="empty-state"><div><strong>No quick-crate records match those filters.</strong>Try another owner or search term.</div></div>';
+      }
+      search.addEventListener('input', render); owner.addEventListener('change', render);
+      fetch('data/library/quick-crate.json').then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      }).then(data => {
+        records = data.records || [];
+        [...new Set(records.map(record => record.owner).filter(Boolean))].sort().forEach(name => owner.add(new Option(name, name)));
+        render();
+      }).catch(error => {
+        summary.textContent = 'Quick crate export unavailable';
+        list.innerHTML = '<div class="empty-state"><div><strong>Export a profile quick crate before opening this page.</strong>Run <code>python3 cue_crate.py export-quick-crate --owner dj-one</code>.</div></div>';
+        console.error(error);
+      });
+    </script>
+  </body>
+</html>

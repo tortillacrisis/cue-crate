@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "dj-one": {
+      "display_name": "DJ One",
+      "providers": {
+        "discogs": {
+          "username": "YOUR_DISCOGS_USERNAME"
+        }
+      }
+    },
+    "dj-two": {
+      "display_name": "DJ Two",
+      "providers": {
+        "discogs": {
+          "username": "COLLABORATOR_DISCOGS_USERNAME"
+        }
+      }
+    }
+  }
+}
