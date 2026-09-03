@@ -37,13 +37,13 @@
       const statusLabel = status => ({unmatched: 'Needs match', auto_selected: 'Auto-selected', approved: 'Approved', rejected: 'No suitable upload'})[status] || status;
       const statusClass = status => ({unmatched: 'badge--review', auto_selected: 'badge--review', approved: 'badge--confirmed', rejected: 'badge--excluded'})[status] || 'badge--info';
       const owner = new URLSearchParams(location.search).get('owner') || '';
-      const reviewServiceOrigin = location.port === '8766' ? location.origin : 'http://127.0.0.1:8766';
+      const reviewServiceOrigin = location.protocol === 'file:' ? 'http://127.0.0.1:8765' : location.origin;
       const apiUrl = path => { const url = new URL(path, reviewServiceOrigin); if (owner) url.searchParams.set('owner', owner); return url.href; };
       async function load() {
         const response = await fetch(apiUrl('/api/youtube-music-review'));
         const contentType = response.headers.get('content-type') || '';
         if (!response.ok || !contentType.includes('application/json')) {
-          throw new Error('Playlist review needs its local owner-aware service.');
+          throw new Error('Playlist review needs the local Cue Crate server.');
         }
         review = await response.json();
         if (review.error) throw new Error(review.error); render();
@@ -82,7 +82,7 @@
       $('#filter').addEventListener('input', render); $('#status').addEventListener('change', render);
       load().catch(error => {
         $('#summary').textContent = error.message;
-        $('#items').innerHTML = '<div class="empty-state"><div><strong>Start the Playlist Review service, then reopen this page.</strong><p>From the project folder run:</p><code>.venv/bin/python3 cue_crate.py serve-youtube-review --owner dj-one --port 8766</code><p><a href="http://127.0.0.1:8766/youtube-review.html">Open Playlist Review ↗</a></p></div></div>';
+        $('#items').innerHTML = '<div class="empty-state"><div><strong>Start Cue Crate, then reopen this page.</strong><p>From the project folder run:</p><code>.venv/bin/python cue_crate.py serve --owner dj-one</code><p><a href="http://127.0.0.1:8765/youtube-review.html">Open Playlist Review ↗</a></p></div></div>';
       });
     </script>
   </body>

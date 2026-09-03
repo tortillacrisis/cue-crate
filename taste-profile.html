@@ -44,7 +44,7 @@
         }
         summary.textContent = 'Loading local taste profile…'; coverage.innerHTML = ''; signals.innerHTML = ''; lanes.innerHTML = '';
         try {
-          const response = await fetch(`data/reports/${encodeURIComponent(profileOwner)}/taste-profile.json`);
+          const response = await fetch(`/api/scout/taste-profile?owner=${encodeURIComponent(profileOwner)}`);
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const profile = await response.json(); const c = profile.coverage;
           summary.textContent = `${profile.owner}'s local profile · ${c.feature_records} verified releases · ${c.quick_crate_records} quick-crate titles · ${c.wantlist_records} Wantlist releases`;

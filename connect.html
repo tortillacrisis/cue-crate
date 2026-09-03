@@ -51,7 +51,7 @@
         $('#copy').disabled = false;
       }
       load().catch(error => {
-        $('#qr-message').innerHTML = `<div><strong>Connection link unavailable.</strong><p>${error.message}</p><p>Make sure this page was opened from <code>serve-mobile</code>, not the static Library server.</p></div>`;
+        $('#qr-message').innerHTML = `<div><strong>Connection link unavailable.</strong><p>${error.message}</p><p>Make sure this page was opened from <code>cue_crate.py serve --lan</code>, not a static file server.</p></div>`;
       });
       $('#copy').onclick = async () => {
         try {

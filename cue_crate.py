@@ -2215,6 +2215,172 @@ def command_serve_youtube_music_review(args: argparse.Namespace) -> None:
         print("\nYouTube Music review server stopped.")
 
 
+APP_STATIC_FILES = {
+    "/viewer.html": "text/html; charset=utf-8",
+    "/quick-crate.html": "text/html; charset=utf-8",
+    "/review.html": "text/html; charset=utf-8",
+    "/taste-profile.html": "text/html; charset=utf-8",
+    "/youtube-review.html": "text/html; charset=utf-8",
+    "/playlists.html": "text/html; charset=utf-8",
+    "/mobile.html": "text/html; charset=utf-8",
+    "/connect.html": "text/html; charset=utf-8",
+    "/app.css": "text/css; charset=utf-8",
+    "/app.js": "application/javascript; charset=utf-8",
+}
+
+REVIEW_GET_ROUTES = {"/api/review", "/api/catalog", "/api/discogs-search"}
+REVIEW_POST_ROUTES = {"/api/decision", "/api/discogs-selection"}
+YOUTUBE_GET_ROUTES = {"/api/youtube-music-review", "/api/playlists", "/api/owners"}
+YOUTUBE_POST_ROUTES = {"/api/youtube-music-review", "/api/playlists"}
+
+
+def make_cue_crate_handler(
+    owner: str,
+    advertised_base: str,
+    session_token: str,
+    discogs_token: Optional[str],
+) -> type[http.server.SimpleHTTPRequestHandler]:
+    """Serve the local product through one port while keeping phone access scoped."""
+    MobileHandler = make_mobile_handler(owner, advertised_base, session_token)
+    ReviewHandler = make_review_handler(owner, discogs_token)
+    YouTubeHandler = make_youtube_review_handler(owner)
+
+    class CueCrateHandler(MobileHandler, ReviewHandler, YouTubeHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            print(f"[cue-crate] {format % args}")
+
+        def local_api_only(self) -> bool:
+            if self.is_loopback_client():
+                return True
+            self.send_error(403, "This Cue Crate API is available only on the serving computer.")
+            return False
+
+        def serve_static(self, path: str) -> None:
+            if path == "/":
+                self.send_response(302)
+                self.send_header("Location", "/viewer.html")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            content_type = APP_STATIC_FILES.get(path)
+            if content_type is None:
+                self.send_error(404)
+                return
+            if path == "/connect.html" and not self.is_loopback_client():
+                self.send_error(403, "The phone connect screen is available only on the serving computer.")
+                return
+            try:
+                body = (ROOT / path.lstrip("/")).read_bytes()
+            except OSError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path.startswith("/api/mobile/"):
+                MobileHandler.do_GET(self)
+                return
+            if path in REVIEW_GET_ROUTES or path.startswith("/api/photo/") or path.startswith("/api/photo-view/"):
+                if self.local_api_only():
+                    ReviewHandler.do_GET(self)
+                return
+            if path in YOUTUBE_GET_ROUTES:
+                if self.local_api_only():
+                    YouTubeHandler.do_GET(self)
+                return
+            if path == "/api/library/catalog":
+                if self.local_api_only():
+                    write_json_response(self, load_catalog())
+                return
+            if path == "/api/library/release-features":
+                if self.local_api_only():
+                    write_json_response(self, load_json(RELEASE_FEATURES_PATH, {"features": {}}))
+                return
+            if path == "/api/library/quick-crate":
+                if self.local_api_only():
+                    write_json_response(self, load_json(AGGREGATE_QUICK_CRATE_PATH, {"records": []}))
+                return
+            if path == "/api/scout/taste-profile":
+                if not self.local_api_only():
+                    return
+                requested_owner = parse_qs(parsed.query, keep_blank_values=True).get("owner", [owner])[0]
+                report_path = person_taste_profile_path(requested_owner)
+                if not report_path.exists():
+                    write_json_response(self, {"error": "Build a taste profile for this profile first."}, 404)
+                    return
+                write_json_response(self, load_json(report_path, {}))
+                return
+            self.serve_static(path)
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            if path == "/api/mobile/upload":
+                MobileHandler.do_POST(self)
+                return
+            if path in REVIEW_POST_ROUTES:
+                if self.local_api_only():
+                    ReviewHandler.do_POST(self)
+                return
+            if path in YOUTUBE_POST_ROUTES:
+                if self.local_api_only():
+                    YouTubeHandler.do_POST(self)
+                return
+            self.send_error(404)
+
+    return CueCrateHandler
+
+
+def command_serve(args: argparse.Namespace) -> None:
+    """Start every Cue Crate screen through one local server."""
+    ensure_data_dir()
+    review_path = person_workspace_path(args.owner, "review.json")
+    if not review_path.exists():
+        candidates_path = person_workspace_path(args.owner, "photo-candidates.json")
+        if candidates_path.exists():
+            build_review(args.owner)
+        else:
+            write_json(review_path, {
+                "schema_version": 1,
+                "generated_at": utc_now(),
+                "owner": args.owner,
+                "items": [],
+            })
+    if not person_youtube_review_path(args.owner).exists():
+        build_youtube_music_review(args.owner)
+    host = "0.0.0.0" if args.lan else "127.0.0.1"
+    address = args.advertise or (mobile_advertised_address() if args.lan else "127.0.0.1")
+    base = f"http://{address}:{args.port}"
+    token = secrets.token_urlsafe(24)
+    os.chdir(ROOT)
+    server = http.server.ThreadingHTTPServer(
+        (host, args.port),
+        make_cue_crate_handler(args.owner, base, token, read_token(args.token_file, args.owner)),
+    )
+    local_base = f"http://127.0.0.1:{args.port}"
+    print(f"Cue Crate: {local_base}/viewer.html")
+    print(f"Review: {local_base}/review.html")
+    print(f"Playlists: {local_base}/playlists.html")
+    print(f"Scout: {local_base}/taste-profile.html?owner={quote(person_context(args.owner)['id'])}")
+    if args.lan:
+        print(f"Phone connect screen: {local_base}/connect.html#token={quote(token)}")
+    else:
+        print("Phone companion is local-only. Re-run with --lan to create a trusted-network QR link.")
+    print("Press Ctrl+C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nCue Crate server stopped.")
+
+
 def youtube_service(client_secrets: str, owner: str):
     try:
         from google.auth.transport.requests import Request as GoogleRequest
@@ -4055,6 +4221,14 @@ def build_parser() -> argparse.ArgumentParser:
     export_quick_crate.add_argument("--owner", required=True)
     export_quick_crate.add_argument("--output-dir", help="Optional export directory; defaults to data/library/quick-crates")
     export_quick_crate.set_defaults(func=command_export_quick_crate)
+
+    serve = commands.add_parser("serve", help="Start the complete local Cue Crate app through one port")
+    serve.add_argument("--owner", required=True, help="Configured profile ID or display name for review, playlists, and phone intake")
+    serve.add_argument("--port", default=8765, type=int, help="Single local app port (default: 8765)")
+    serve.add_argument("--lan", action="store_true", help="Enable the token-protected phone companion on the trusted local network")
+    serve.add_argument("--advertise", help="LAN address to place in the QR URL when auto-detection is unsuitable")
+    serve.add_argument("--token-file", help="Optional local Discogs token for the in-app review search and release picker")
+    serve.set_defaults(func=command_serve)
 
     serve_review = commands.add_parser("serve-review", help="Open the local review interface")
     serve_review.add_argument("--owner", required=True)

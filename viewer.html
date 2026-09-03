@@ -293,8 +293,8 @@
         return response.json();
       });
       Promise.all([
-        readJson('data/library/catalog.json'),
-        readJson('data/cache/discogs/release-features.json').catch(() => ({features: {}})),
+        readJson('/api/library/catalog'),
+        readJson('/api/library/release-features').catch(() => ({features: {}})),
       ]).then(([catalogue, featureData]) => {
         const featureMap = featureData.features || {};
         records = (catalogue.records || []).map(record => hydrateRecord(record, featureMap));
@@ -304,7 +304,7 @@
         render();
       }).catch(error => {
         summary.textContent = 'Catalogue unavailable'; message.hidden = false;
-        message.innerHTML = '<div><strong>Serve Cue Crate locally to open the library.</strong>Run <code>python3 -m http.server</code> from this project folder, then open this page through that server.</div>';
+        message.innerHTML = '<div><strong>Start Cue Crate to open the library.</strong>Run <code>python3 cue_crate.py serve --owner dj-one</code> from this project folder, then open this page through that server.</div>';
         console.error(error);
       });
     </script>

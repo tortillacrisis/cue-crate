@@ -48,7 +48,7 @@
       let state = null, activeId = '', providerFilter = 'all';
       const requestedOwner = new URLSearchParams(location.search).get('owner') || '';
       let currentOwner = requestedOwner;
-      const ownerServiceOrigin = location.port === '8766' ? location.origin : 'http://127.0.0.1:8766';
+      const ownerServiceOrigin = location.protocol === 'file:' ? 'http://127.0.0.1:8765' : location.origin;
 
       function ownerApiUrl(path) {
         const url = new URL(path, ownerServiceOrigin);
@@ -268,7 +268,7 @@
       }
       function showLoadError(error) {
         summary.textContent = error.message;
-        list.innerHTML = '<div class="empty-state"><div><strong>Start the profile-aware playlist service, then reopen this page.</strong><p>Open <a href="http://127.0.0.1:8766/playlists.html">the manager on port 8766</a>, or run <code>python3 cue_crate.py serve-youtube-review --owner dj-one --port 8766</code>.</p></div></div>';
+        list.innerHTML = '<div class="empty-state"><div><strong>Start Cue Crate, then reopen this page.</strong><p>Open <a href="http://127.0.0.1:8765/playlists.html">the manager on port 8765</a>, or run <code>python3 cue_crate.py serve --owner dj-one</code>.</p></div></div>';
       }
       if (location.origin !== ownerServiceOrigin && location.protocol !== 'file:') {
         const target = new URL('/playlists.html', ownerServiceOrigin);

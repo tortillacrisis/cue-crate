@@ -60,7 +60,7 @@
         }).join('') : '<div class="empty-state"><div><strong>No quick-crate records match those filters.</strong>Try another owner or search term.</div></div>';
       }
       search.addEventListener('input', render); owner.addEventListener('change', render);
-      fetch('data/library/quick-crate.json').then(response => {
+      fetch('/api/library/quick-crate').then(response => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return response.json();
       }).then(data => {
