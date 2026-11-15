@@ -71,6 +71,8 @@
       const gridView = document.querySelector('#grid-view');
       const listView = document.querySelector('#list-view');
       let records = [], groups = [], layout = 'grid';
+      let playerQueue = [], activeVideoIndex = -1, youtubePlayer = null, youtubeApiPromise = null, activeDialogKey = '';
+      let spotifyConnection = null, spotifyPlayer = null, spotifyDeviceId = '', spotifySdkPromise = null, spotifyPlayerPromise = null;
       const facetModes = {genres: new Map(), styles: new Map(), formats: new Map()};
       const formatOptions = [['vinyl', 'Vinyl'], ['lp', 'LP'], ['12', '12″'], ['7', '7″'], ['cd', 'CD'], ['cassette', 'Cassette']];
 
@@ -79,6 +81,405 @@
         ? `<img class="${className}" src="${esc(record.cover_image)}" alt="${esc(`${record.artist} — ${record.title}`)}" loading="lazy">`
         : `<div class="record-placeholder" aria-hidden="true">◒</div>`;
       const recordMeta = record => [record.label, record.year, record.format, ...(record.styles || []).slice(0, 2), ...(record.crate_locations || [])].filter(Boolean).join(' · ');
+
+      function discogsUrl(record) {
+        const releaseId = String(record.discogs_release_id || '').trim();
+        const fallback = releaseId ? `https://www.discogs.com/release/${releaseId}` : '';
+        const value = String(record.discogs_url || '').trim();
+        if (!value) return fallback;
+        try {
+          const parsed = new URL(value);
+          const apiRelease = parsed.hostname === 'api.discogs.com' && parsed.pathname.match(/\/releases?\/(\d+)/i);
+          if (apiRelease) return `https://www.discogs.com/release/${apiRelease[1]}`;
+        } catch (_) {
+          return fallback;
+        }
+        return value;
+      }
+      function formatDuration(seconds) {
+        const total = Number(seconds) || 0;
+        if (!total) return '';
+        return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+      }
+      function playerPageUrl() {
+        return `${window.location.origin}${window.location.pathname}${window.location.search}`;
+      }
+      function destroyAlbumPlayer() {
+        if (youtubePlayer && typeof youtubePlayer.destroy === 'function') youtubePlayer.destroy();
+        youtubePlayer = null;
+        playerQueue = [];
+        activeVideoIndex = -1;
+      }
+      function loadYouTubeIframeApi() {
+        if (window.YT && typeof window.YT.Player === 'function') return Promise.resolve(window.YT);
+        if (youtubeApiPromise) return youtubeApiPromise;
+        youtubeApiPromise = new Promise((resolve, reject) => {
+          const previous = window.onYouTubeIframeAPIReady;
+          window.onYouTubeIframeAPIReady = () => {
+            if (typeof previous === 'function') previous();
+            resolve(window.YT);
+          };
+          const script = document.createElement('script');
+          script.src = 'https://www.youtube.com/iframe_api';
+          script.async = true;
+          script.onerror = () => reject(new Error('YouTube player could not load.'));
+          document.head.append(script);
+        });
+        return youtubeApiPromise;
+      }
+      function renderVideoQueue() {
+        const list = document.querySelector('#album-video-list');
+        const nowPlaying = document.querySelector('#album-now-playing');
+        if (!list) return;
+        list.innerHTML = playerQueue.map((video, index) => {
+          const unavailable = Boolean(video.unavailable);
+          const detail = unavailable ? `Error ${video.playerErrorCode || '?'} · YouTube ↗` : `${video.source || 'Discogs'}${formatDuration(video.duration) ? ` · ${formatDuration(video.duration)}` : ''}`;
+          return `<li><button class="album-video${index === activeVideoIndex ? ' is-playing' : ''}${unavailable ? ' is-unavailable' : ''}" type="button" data-video-index="${index}" aria-current="${index === activeVideoIndex ? 'true' : 'false'}"><span class="album-video__number">${String(index + 1).padStart(2, '0')}</span><span class="album-video__title">${esc(video.title)}</span><span class="album-video__meta">${esc(detail)}</span></button></li>`;
+        }).join('');
+        list.querySelectorAll('[data-video-index]').forEach(button => {
+          button.onclick = () => {
+            const video = playerQueue[Number(button.dataset.videoIndex)];
+            if (video?.unavailable) window.open(video.url, '_blank', 'noopener,noreferrer');
+            else playAlbumVideo(Number(button.dataset.videoIndex));
+          };
+        });
+        const active = playerQueue[activeVideoIndex];
+        if (nowPlaying) nowPlaying.textContent = active && !active.unavailable ? `Now playing · ${active.title}` : 'Choose a video to play.';
+        list.querySelector('.is-playing')?.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+        updatePlayerDiagnostics();
+      }
+      function updatePlayerDiagnostics() {
+        const target = document.querySelector('#album-player-diagnostics');
+        if (!target) return;
+        const failed = playerQueue.filter(video => video.unavailable);
+        const errors = failed.length ? ` · failures: ${failed.map(video => `${video.video_id}=${video.playerErrorCode || '?'}`).join(', ')}` : '';
+        target.textContent = `origin=${window.location.origin} · widget_referrer=${playerPageUrl()}${errors}`;
+      }
+      function firstPlayableVideo(startAt = 0) {
+        for (let index = startAt; index < playerQueue.length; index += 1) {
+          if (!playerQueue[index].unavailable) return index;
+        }
+        return -1;
+      }
+      function playerErrorSummary(code) {
+        if (code === 101 || code === 150) return 'This upload blocks playback on other websites.';
+        if (code === 100) return 'This upload is no longer available.';
+        if (code === 2 || code === 5) return 'YouTube cannot play this upload in the embedded player.';
+        if (code === 153) return 'YouTube did not accept this player request.';
+        return 'YouTube declined this upload in the embedded player.';
+      }
+      function handleAlbumPlayerError(code) {
+        const video = playerQueue[activeVideoIndex];
+        if (!video || video.unavailable) return;
+        video.unavailable = true;
+        video.playerErrorCode = code;
+        const next = firstPlayableVideo(activeVideoIndex + 1);
+        const notice = document.querySelector('#album-player-notice');
+        if (notice) notice.textContent = next >= 0
+          ? `YouTube error ${code}: ${playerErrorSummary(code)} Trying the next linked video.`
+          : `YouTube error ${code}: ${playerErrorSummary(code)} None of this release's linked uploads can play here.`;
+        if (next >= 0) playAlbumVideo(next);
+        else {
+          activeVideoIndex = -1;
+          renderVideoQueue();
+          const nowPlaying = document.querySelector('#album-now-playing');
+          if (nowPlaying) nowPlaying.textContent = 'Use “Watch on YouTube” for the blocked uploads.';
+        }
+      }
+      function playAlbumVideo(index) {
+        const video = playerQueue[index];
+        if (!video || video.unavailable) return;
+        activeVideoIndex = index;
+        renderVideoQueue();
+        const host = document.querySelector('#youtube-player');
+        if (!host) return;
+        loadYouTubeIframeApi().then(YT => {
+          if (!document.querySelector('#youtube-player') || playerQueue[index] !== video) return;
+          if (youtubePlayer && typeof youtubePlayer.loadVideoById === 'function') {
+            youtubePlayer.loadVideoById(video.video_id);
+            return;
+          }
+          youtubePlayer = new YT.Player('youtube-player', {
+            videoId: video.video_id,
+            playerVars: {
+              autoplay: 1,
+              playsinline: 1,
+              rel: 0,
+              origin: window.location.origin,
+              widget_referrer: playerPageUrl(),
+            },
+            events: {
+              onReady: () => updatePlayerDiagnostics(),
+              onStateChange: event => {
+                if (event.data !== YT.PlayerState.ENDED) return;
+                const next = firstPlayableVideo(activeVideoIndex + 1);
+                if (next >= 0) playAlbumVideo(next);
+                else {
+                  const nowPlaying = document.querySelector('#album-now-playing');
+                  if (nowPlaying) nowPlaying.textContent = 'Album video list finished.';
+                }
+              },
+              onError: event => handleAlbumPlayerError(event.data),
+            },
+          });
+        }).catch(error => {
+          host.innerHTML = `<p class="summary">${esc(error.message)} <a href="${esc(video.url)}" target="_blank" rel="noreferrer">Open on YouTube ↗</a></p>`;
+        });
+      }
+      function renderAlbumVideoMessage(html) {
+        const target = document.querySelector('#album-videos');
+        if (target) target.innerHTML = html;
+      }
+      async function loadAlbumVideos(record, dialogKey) {
+        const releaseId = String(record.discogs_release_id || '').trim();
+        if (!releaseId) {
+          const query = encodeURIComponent(`${record.artist || ''} ${record.title || ''}`.trim());
+          renderAlbumVideoMessage(`<p class="summary">Choose an exact Discogs pressing to load album videos. <a href="https://www.youtube.com/results?search_query=${query}" target="_blank" rel="noreferrer">Search YouTube ↗</a></p>`);
+          return;
+        }
+        try {
+          const response = await cueCrateFetch(`/api/library/release-videos?release_id=${encodeURIComponent(releaseId)}`);
+          const payload = await response.json();
+          if (activeDialogKey !== dialogKey || !dialog.open) return;
+          if (!response.ok) throw new Error(payload.error || 'Could not load album videos.');
+          playerQueue = Array.isArray(payload.videos) ? payload.videos : [];
+          if (!playerQueue.length) {
+            renderAlbumVideoMessage(`<p class="summary">Discogs does not list embeddable videos for this pressing yet. <a href="${esc(discogsUrl(record))}" target="_blank" rel="noreferrer">Browse the release on Discogs ↗</a></p>`);
+            return;
+          }
+          renderAlbumVideoMessage(`<div class="album-player"><div class="album-player__frame"><div id="youtube-player"><p class="summary">Select a video to begin.</p></div></div><p id="album-now-playing" class="album-player__now">Choose a video to play.</p><p id="album-player-notice" class="album-player__notice" aria-live="polite"></p><ol id="album-video-list" class="album-video-list"></ol><details class="album-player__diagnostics"><summary>Player diagnostics</summary><code id="album-player-diagnostics"></code></details></div>`);
+          renderVideoQueue();
+        } catch (error) {
+          if (activeDialogKey === dialogKey) renderAlbumVideoMessage(`<p class="summary">${esc(error.message || 'Album videos are unavailable right now.')} Try again later or <a href="${esc(discogsUrl(record))}" target="_blank" rel="noreferrer">browse the release on Discogs ↗</a>.</p>`);
+        }
+      }
+
+      function spotifySearchUrl(record) {
+        const query = encodeURIComponent(`${record.artist || ''} ${record.title || ''}`.trim());
+        return `https://open.spotify.com/search/${query}`;
+      }
+      function spotifyConnectUrl(record) {
+        return '/api/spotify/login';
+      }
+      function setSpotifyPlayerStatus(message, tone = '') {
+        document.querySelectorAll('[data-spotify-player-status]').forEach(target => {
+          target.textContent = message;
+          target.dataset.tone = tone;
+        });
+      }
+      function updateSpotifyPlaybackState(state) {
+        const current = state?.track_window?.current_track;
+        const label = current ? `${(current.artists || []).map(artist => artist.name).join(', ')} — ${current.name}` : '';
+        document.querySelectorAll('[data-spotify-now-playing]').forEach(target => {
+          target.textContent = label ? `Now playing · ${label}` : 'Ready for a full-length Spotify stream.';
+        });
+        document.querySelectorAll('[data-spotify-toggle]').forEach(button => {
+          button.textContent = state && !state.paused ? 'Pause' : 'Play / resume';
+        });
+      }
+      function loadSpotifyWebPlaybackSdk() {
+        if (window.Spotify?.Player) return Promise.resolve(window.Spotify);
+        if (spotifySdkPromise) return spotifySdkPromise;
+        spotifySdkPromise = new Promise((resolve, reject) => {
+          const previous = window.onSpotifyWebPlaybackSDKReady;
+          window.onSpotifyWebPlaybackSDKReady = () => {
+            if (typeof previous === 'function') previous();
+            resolve(window.Spotify);
+          };
+          const script = document.createElement('script');
+          script.src = 'https://sdk.scdn.co/spotify-player.js';
+          script.async = true;
+          script.onerror = () => reject(new Error('Spotify’s full player could not load.'));
+          document.head.append(script);
+        });
+        return spotifySdkPromise;
+      }
+      async function spotifyPlaybackAccessToken() {
+        const response = await cueCrateFetch('/api/spotify/access-token', {cache: 'no-store'});
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || 'Spotify playback authorization is unavailable.');
+        return payload.access_token;
+      }
+      async function ensureSpotifyWebPlayer() {
+        if (spotifyPlayer && spotifyDeviceId) return spotifyDeviceId;
+        if (spotifyPlayerPromise) return spotifyPlayerPromise;
+        spotifyPlayerPromise = loadSpotifyWebPlaybackSdk().then(Spotify => new Promise((resolve, reject) => {
+          let settled = false;
+          spotifyPlayer = new Spotify.Player({
+            name: 'Cue Crate',
+            volume: 0.65,
+            enableMediaSession: true,
+            getOAuthToken: callback => spotifyPlaybackAccessToken().then(callback).catch(error => {
+              setSpotifyPlayerStatus(error.message, 'error');
+              if (!settled) { settled = true; reject(error); }
+            }),
+          });
+          spotifyPlayer.addListener('ready', ({device_id: deviceId}) => {
+            spotifyDeviceId = deviceId;
+            setSpotifyPlayerStatus('Cue Crate is connected as a Spotify playback device.', 'ready');
+            if (!settled) { settled = true; resolve(deviceId); }
+          });
+          spotifyPlayer.addListener('not_ready', () => {
+            spotifyDeviceId = '';
+            spotifyPlayerPromise = null;
+            setSpotifyPlayerStatus('The Spotify browser device went offline. Press play to reconnect.', 'error');
+          });
+          ['initialization_error', 'authentication_error', 'account_error', 'playback_error'].forEach(eventName => {
+            spotifyPlayer.addListener(eventName, ({message}) => {
+              const error = new Error(message || `Spotify ${eventName.replace('_', ' ')}.`);
+              setSpotifyPlayerStatus(error.message, 'error');
+              if (!settled) { settled = true; spotifyPlayerPromise = null; reject(error); }
+            });
+          });
+          spotifyPlayer.addListener('player_state_changed', updateSpotifyPlaybackState);
+          spotifyPlayer.connect().then(connected => {
+            if (!connected && !settled) {
+              settled = true;
+              spotifyPlayerPromise = null;
+              reject(new Error('Spotify did not connect the Cue Crate browser player.'));
+            }
+          });
+        })).catch(error => {
+          spotifyPlayerPromise = null;
+          throw error;
+        });
+        return spotifyPlayerPromise;
+      }
+      async function playSpotifySource(source) {
+        setSpotifyPlayerStatus('Starting full-length playback…');
+        try {
+          const deviceId = await ensureSpotifyWebPlayer();
+          if (typeof spotifyPlayer.activateElement === 'function') await spotifyPlayer.activateElement();
+          const response = await cueCrateFetch('/api/spotify/play', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({device_id: deviceId, uri: source.uri || `spotify:${source.kind}:${source.id}`}),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(payload.error || 'Spotify could not start this selection.');
+          setSpotifyPlayerStatus(`Playing the matched ${source.kind === 'track' ? 'track' : 'album'} through your Premium account.`, 'ready');
+        } catch (error) {
+          setSpotifyPlayerStatus(error.message || 'Spotify playback failed.', 'error');
+        }
+      }
+      function renderSpotifySource(record, source = null, notice = '', candidates = []) {
+        const target = document.querySelector('#spotify-source');
+        if (!target) return;
+        const releaseId = String(record.discogs_release_id || '').trim();
+        if (!releaseId) {
+          target.innerHTML = `<p class="summary">Choose an exact Discogs pressing before saving a listening source. <a href="${esc(spotifySearchUrl(record))}" target="_blank" rel="noreferrer">Search Spotify ↗</a></p>`;
+          return;
+        }
+        const saved = source && source.embed_url && source.url;
+        const confidence = source?.confidence || (source?.match_method === 'manual_url' ? 'confirmed' : '');
+        const confidenceLabel = confidence === 'high' ? 'High-confidence match' : confidence === 'medium' ? 'Review suggested' : confidence === 'low' ? 'Low-confidence match' : confidence === 'confirmed' ? 'Confirmed match' : '';
+        const playbackReady = Boolean(spotifyConnection?.playback_available);
+        const playbackMessage = spotifyConnection?.reauthorization_required
+          ? 'Reconnect Spotify once to grant the full-player permissions.'
+          : spotifyConnection?.connected ? 'Preparing Cue Crate as a Spotify playback device…' : 'Connect Spotify to enable full playback.';
+        const player = saved
+          ? `<div class="spotify-web-player"><div class="spotify-web-player__release">${source.cover_image || record.cover_image ? `<img src="${esc(source.cover_image || record.cover_image)}" alt="" loading="lazy">` : '<span class="spotify-web-player__art" aria-hidden="true">♫</span>'}<span><b>${esc(source.artist || record.artist || '')}</b><strong>${esc(source.name || record.title || '')}</strong><small>${source.kind === 'track' ? 'Matched track' : 'Matched album · plays in sequence'}</small></span></div><div class="spotify-web-player__transport"><button type="button" class="button--primary" data-spotify-play-source ${playbackReady ? '' : 'disabled'}>Play ${source.kind === 'track' ? 'track' : 'full album'}</button><button type="button" class="button--quiet" data-spotify-previous ${playbackReady ? '' : 'disabled'} aria-label="Previous Spotify track">Previous</button><button type="button" class="button--quiet" data-spotify-toggle ${playbackReady ? '' : 'disabled'}>Play / resume</button><button type="button" class="button--quiet" data-spotify-next ${playbackReady ? '' : 'disabled'} aria-label="Next Spotify track">Next</button></div><p class="spotify-web-player__now" data-spotify-now-playing>Ready for a full-length Spotify stream.</p><p class="spotify-web-player__status" data-spotify-player-status aria-live="polite">${esc(playbackMessage)}</p>${spotifyConnection?.reauthorization_required ? `<a class="button button--quiet" href="${esc(spotifyConnectUrl(record))}">Reconnect Spotify for full playback →</a>` : ''}</div>`
+          : `<div class="spotify-empty"><span aria-hidden="true">♫</span><p><b>No automatic match yet.</b><br><small>Connect Spotify and Cue Crate will compare the release metadata and tracklist.</small></p></div>`;
+        const alternatives = candidates.length ? `<details class="spotify-candidates"><summary>Match evidence and alternatives</summary><div class="spotify-candidate-list">${candidates.map((candidate, index) => `<article class="spotify-candidate ${candidate.id === source?.id ? 'is-selected' : ''}">${candidate.cover_image ? `<img src="${esc(candidate.cover_image)}" alt="" loading="lazy">` : ''}<span><b>${esc(candidate.artist || 'Unknown artist')} — ${esc(candidate.name || 'Untitled')}</b><small>${esc([candidate.release_date, candidate.album_type, candidate.total_tracks ? `${candidate.total_tracks} tracks` : '', `${candidate.score || 0}% match`].filter(Boolean).join(' · '))}</small><small>${esc((candidate.evidence || []).join(' · '))}</small></span><button type="button" class="button--quiet" data-spotify-candidate="${esc(candidate.id)}" ${candidate.id === source?.id ? 'disabled' : ''}>${candidate.id === source?.id ? 'Selected' : 'Use this'}</button></article>`).join('')}</div></details>` : '';
+        const accountAction = saved
+          ? `<a class="button button--quiet" href="${esc(source.url)}" target="_blank" rel="noreferrer">Open in Spotify ↗</a>`
+          : spotifyConnection?.connected ? '' : `<a class="button button--primary" href="${esc(spotifyConnectUrl(record))}">Connect Spotify</a>`;
+        target.innerHTML = `${saved ? `<div class="spotify-match-heading"><span><b>${esc(source.artist || '')} — ${esc(source.name || '')}</b><small>${esc((source.evidence || []).join(' · '))}</small></span>${confidenceLabel ? `<span class="badge ${confidence === 'medium' || confidence === 'low' ? 'badge--info' : 'badge--confirmed'}">${esc(confidenceLabel)}</span>` : ''}</div>` : ''}${player}<div class="spotify-source__editor"><div class="spotify-source__actions">${accountAction}<button type="button" class="button--quiet" data-spotify-rematch>${saved ? 'Run match again' : 'Find automatically'}</button><span class="spotify-source__status" data-spotify-status aria-live="polite">${esc(notice)}</span></div>${alternatives}<details class="spotify-manual"><summary>Advanced · use an exact Spotify URL</summary><label class="spotify-source__field"><span>Spotify album or track link</span><input type="url" inputmode="url" autocomplete="off" data-spotify-url placeholder="https://open.spotify.com/album/…" value="${saved ? esc(source.url) : ''}"></label><div class="spotify-source__actions"><button type="button" class="button--quiet" data-spotify-save>Use exact URL</button>${saved ? '<button type="button" class="button--quiet" data-spotify-remove>Remove match</button>' : ''}<a class="button button--quiet" href="${esc(spotifySearchUrl(record))}" target="_blank" rel="noreferrer">Search Spotify ↗</a></div></details></div>`;
+        target.querySelector('[data-spotify-save]').onclick = () => saveSpotifySource(record, target.querySelector('[data-spotify-url]').value, activeDialogKey);
+        target.querySelector('[data-spotify-rematch]').onclick = () => discoverSpotifySource(record, activeDialogKey, true);
+        target.querySelectorAll('[data-spotify-candidate]').forEach(button => button.onclick = () => selectSpotifyCandidate(record, button.dataset.spotifyCandidate, activeDialogKey));
+        const playSource = target.querySelector('[data-spotify-play-source]');
+        if (playSource) playSource.onclick = () => playSpotifySource(source);
+        const toggle = target.querySelector('[data-spotify-toggle]');
+        if (toggle) toggle.onclick = () => spotifyPlayer?.togglePlay();
+        const previous = target.querySelector('[data-spotify-previous]');
+        if (previous) previous.onclick = () => spotifyPlayer?.previousTrack();
+        const next = target.querySelector('[data-spotify-next]');
+        if (next) next.onclick = () => spotifyPlayer?.nextTrack();
+        const remove = target.querySelector('[data-spotify-remove]');
+        if (remove) remove.onclick = () => saveSpotifySource(record, '', activeDialogKey);
+      }
+      async function discoverSpotifySource(record, dialogKey, refresh = false) {
+        const target = document.querySelector('#spotify-source');
+        if (!target) return;
+        target.querySelectorAll('button').forEach(button => { button.disabled = true; });
+        const status = target.querySelector('[data-spotify-status]');
+        if (status) status.textContent = 'Comparing Spotify albums and tracklists…';
+        try {
+          const response = await cueCrateFetch('/api/library/spotify-match', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'discover', release_id: record.discogs_release_id, refresh})});
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || 'Could not search Spotify.');
+          if (activeDialogKey !== dialogKey || !dialog.open) return;
+          const best = (payload.spotify_candidates || [])[0];
+          const matchNotice = payload.spotify
+            ? `Selected automatically at ${payload.spotify.score || 0}% confidence score.`
+            : best ? `Best candidate scored ${best.score || 0}% and needs your confirmation.` : 'Spotify returned no suitable candidates.';
+          renderSpotifySource(record, payload.spotify, matchNotice, payload.spotify_candidates || []);
+        } catch (error) {
+          if (activeDialogKey === dialogKey) renderSpotifySource(record, null, error.message || 'Could not search Spotify.');
+        }
+      }
+      async function selectSpotifyCandidate(record, spotifyId, dialogKey) {
+        const target = document.querySelector('#spotify-source');
+        const status = target?.querySelector('[data-spotify-status]');
+        if (status) status.textContent = 'Confirming Spotify match…';
+        try {
+          const response = await cueCrateFetch('/api/library/spotify-match', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'select', release_id: record.discogs_release_id, spotify_id: spotifyId})});
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || 'Could not select that Spotify match.');
+          if (activeDialogKey === dialogKey && dialog.open) renderSpotifySource(record, payload.spotify, 'Match confirmed.', payload.spotify_candidates || []);
+        } catch (error) {
+          if (status) status.textContent = error.message || 'Could not select that Spotify match.';
+        }
+      }
+      async function saveSpotifySource(record, spotifyUrl, dialogKey) {
+        const target = document.querySelector('#spotify-source');
+        if (!target) return;
+        const controls = [...target.querySelectorAll('button, input')];
+        controls.forEach(control => { control.disabled = true; });
+        const status = target.querySelector('[data-spotify-status]');
+        if (status) status.textContent = spotifyUrl.trim() ? 'Saving…' : 'Removing…';
+        try {
+          const response = await cueCrateFetch('/api/library/playback-sources', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({release_id: record.discogs_release_id, spotify_url: spotifyUrl.trim()}),
+          });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || 'Could not save the Spotify source.');
+          if (activeDialogKey !== dialogKey || !dialog.open) return;
+          renderSpotifySource(record, payload.spotify, payload.spotify ? 'Exact Spotify URL saved.' : 'Spotify match removed.', payload.spotify_candidates || []);
+        } catch (error) {
+          controls.forEach(control => { control.disabled = false; });
+          if (status) status.textContent = error.message || 'Could not save the Spotify source.';
+        }
+      }
+      async function loadSpotifySource(record, dialogKey) {
+        const releaseId = String(record.discogs_release_id || '').trim();
+        if (!releaseId) {
+          renderSpotifySource(record);
+          return;
+        }
+        try {
+          const [response, statusResponse] = await Promise.all([
+            cueCrateFetch(`/api/library/playback-sources?release_id=${encodeURIComponent(releaseId)}`),
+            cueCrateFetch('/api/spotify/status', {cache: 'no-store'}),
+          ]);
+          const payload = await response.json();
+          spotifyConnection = await statusResponse.json().catch(() => null);
+          if (!response.ok) throw new Error(payload.error || 'Could not load the Spotify source.');
+          if (activeDialogKey !== dialogKey || !dialog.open) return;
+          if (payload.spotify) {
+            renderSpotifySource(record, payload.spotify, '', payload.spotify_candidates || []);
+            if (spotifyConnection?.playback_available) ensureSpotifyWebPlayer().catch(error => setSpotifyPlayerStatus(error.message, 'error'));
+          }
+          else {
+            renderSpotifySource(record, null, 'Starting automatic match…');
+            discoverSpotifySource(record, dialogKey);
+          }
+        } catch (error) {
+          if (activeDialogKey === dialogKey) renderSpotifySource(record, null, error.message || 'Spotify source unavailable.');
+        }
+      }
 
       function normalise(value) {
         return String(value || '').toLocaleLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '');
@@ -258,16 +659,21 @@
       }
 
       function openRecord(group, selectedRecord = group.primary) {
+        destroyAlbumPlayer();
         const record = selectedRecord;
+        const dialogKey = `${record.id || ''}::${record.discogs_release_id || ''}::${Date.now()}`;
+        activeDialogKey = dialogKey;
         const tracks = (record.tracklist || []).filter(track => track.title).map(track => {
           const data = [track.bpm ? `${track.bpm} BPM` : '', track.key || '', track.duration || ''].filter(Boolean).join(' · ');
           return `<li class="track-row"><span class="track-row__position">${esc(track.position || '—')}</span><span class="track-row__title">${esc(track.artist && track.artist !== record.artist ? `${track.artist} — ${track.title}` : track.title)}</span><span class="track-row__data">${esc(data)}</span></li>`;
         }).join('');
         const copies = group.copies.map(copy => `<li><span><b>${esc(copy.owner || 'Unknown profile')}</b><br><small>${esc(recordMeta(copy) || 'Metadata unavailable')}</small></span>${copy.quick_access ? '<span class="badge badge--accent">Quick crate</span>' : ''}</li>`).join('');
-        const discogs = record.discogs_url || (record.discogs_release_id ? `https://www.discogs.com/release/${record.discogs_release_id}` : '');
-        dialogContent.innerHTML = `<div class="dialog__inner">${cover(record, 'dialog__cover')}<div class="dialog__body"><div class="dialog__topline"><span class="chip">${esc(group.owners.join(' + ') || 'Unknown profile')}</span><button type="button" class="button--quiet" data-close>Close</button></div><h2 id="dialog-title" class="dialog__title">${esc(record.artist || 'Unknown artist')}<br>— ${esc(record.title || 'Untitled')}</h2><p class="dialog__meta">${esc(recordMeta(record) || 'Metadata unavailable')}<br>${record.catalog_number ? `CAT. ${esc(record.catalog_number)}` : ''}</p>${group.copies.length > 1 ? `<div class="dialog__copies"><p class="section-label">${group.copies.length} physical copies</p><ul>${copies}</ul></div>` : ''}<div class="dialog__tracks"><p class="section-label">Tracks · DJ metadata</p>${tracks ? `<ol>${tracks}</ol>` : '<p class="summary">Tracklist has not been enriched yet.</p>'}</div><div class="dialog__actions">${discogs ? `<a class="button button--primary" href="${esc(discogs)}" target="_blank" rel="noreferrer">Open Discogs ↗</a>` : ''}${group.quick ? '<span class="badge badge--accent">In the quick crate</span>' : ''}</div></div></div>`;
+        const discogs = discogsUrl(record);
+        dialogContent.innerHTML = `<div class="dialog__inner">${cover(record, 'dialog__cover')}<div class="dialog__body"><div class="dialog__topline"><span class="chip">${esc(group.owners.join(' + ') || 'Unknown profile')}</span><button type="button" class="button--quiet" data-close>Close</button></div><h2 id="dialog-title" class="dialog__title">${esc(record.artist || 'Unknown artist')}<br>— ${esc(record.title || 'Untitled')}</h2><p class="dialog__meta">${esc(recordMeta(record) || 'Metadata unavailable')}<br>${record.catalog_number ? `CAT. ${esc(record.catalog_number)}` : ''}</p>${group.copies.length > 1 ? `<div class="dialog__copies"><p class="section-label">${group.copies.length} physical copies</p><ul>${copies}</ul></div>` : ''}<div class="dialog__tracks"><p class="section-label">Tracks · DJ metadata</p>${tracks ? `<ol>${tracks}</ol>` : '<p class="summary">Tracklist has not been enriched yet.</p>'}</div><section class="dialog__spotify" aria-label="Spotify listening player"><div class="dialog__section-heading"><p class="section-label">Listen on Spotify</p><span class="summary">Premium · full player</span></div><div id="spotify-source"><p class="summary">Loading Spotify source…</p></div></section><section class="dialog__videos" aria-label="Album videos"><div class="dialog__section-heading"><p class="section-label">Album videos</p><span class="summary">Discogs links · click to play</span></div><div id="album-videos"><p class="summary">Finding Discogs-linked videos…</p></div></section><div class="dialog__actions">${discogs ? `<a class="button button--primary" href="${esc(discogs)}" target="_blank" rel="noreferrer">Open Discogs ↗</a>` : ''}${group.quick ? '<span class="badge badge--accent">In the quick crate</span>' : ''}</div></div></div>`;
         dialogContent.querySelector('[data-close]').onclick = () => dialog.close();
         if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open', '');
+        loadSpotifySource(record, dialogKey);
+        loadAlbumVideos(record, dialogKey);
       }
 
       function setLayout(next) {
@@ -288,7 +694,8 @@
       };
       gridView.onclick = () => setLayout('grid'); listView.onclick = () => setLayout('list');
       dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
-      const readJson = path => fetch(path).then(response => {
+      dialog.addEventListener('close', () => { activeDialogKey = ''; destroyAlbumPlayer(); });
+      const readJson = path => cueCrateFetch(path).then(response => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return response.json();
       });
@@ -302,6 +709,12 @@
         populateFacetOptions();
         [...new Set(records.map(record => record.owner).filter(Boolean))].sort().forEach(name => owner.add(new Option(name, name)));
         render();
+        const requestedRelease = new URLSearchParams(location.search).get('release_id');
+        if (requestedRelease) {
+          const requestedRecord = records.find(record => String(record.discogs_release_id || '') === requestedRelease);
+          const requestedGroup = requestedRecord && groups.find(group => group.copies.includes(requestedRecord));
+          if (requestedGroup) openRecord(requestedGroup, requestedRecord);
+        }
       }).catch(error => {
         summary.textContent = 'Catalogue unavailable'; message.hidden = false;
         message.innerHTML = '<div><strong>Start Cue Crate to open the library.</strong>Run <code>python3 cue_crate.py serve --owner dj-one</code> from this project folder, then open this page through that server.</div>';

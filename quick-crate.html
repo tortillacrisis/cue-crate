@@ -55,7 +55,7 @@
           const meta = [record.label, record.year, record.format].filter(Boolean).join(' · ') || `${record.photo_file || 'Local source'} · position ${record.grid_position || '—'}`;
           const label = `${record.artist || 'Unknown artist'} — ${record.title || record.visible_text || 'Unidentified'}`;
           const tag = `<span class="badge ${record.identity_source === 'confirmed_catalog' ? 'badge--confirmed' : 'badge--info'}">${esc(sourceLabel(record.identity_source))}</span>`;
-          const inner = `<span class="record-row__index">${String(index + 1).padStart(2, '0')}</span><span><h2>${esc(label)}</h2><p>${esc(meta)}</p></span><span class="chip">${esc(record.owner || 'Unknown profile')}</span>`;
+          const inner = `<span class="record-row__index">${String(index + 1).padStart(2, '0')}</span><span><h2>${esc(label)}</h2><p>${esc(meta)}</p></span><span class="record-row__badges">${tag}<span class="chip">${esc(record.owner || 'Unknown profile')}</span></span>`;
           return record.discogs_url ? `<a class="record-row" href="${esc(record.discogs_url)}" target="_blank" rel="noreferrer" aria-label="Open ${esc(label)} on Discogs">${inner}</a>` : `<article class="record-row">${inner}</article>`;
         }).join('') : '<div class="empty-state"><div><strong>No quick-crate records match those filters.</strong>Try another owner or search term.</div></div>';
       }

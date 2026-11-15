@@ -10,7 +10,7 @@ debugging or compatibility; they are not the recommended way to run the app.
 The local pages share the **After-Hours Index** design system: a warm, cover-led record
 library with a responsive mobile navigation pattern, a focused review workspace, and room
 for future BPM/key/transition metadata. The reusable tokens and component rules live in
-[DESIGN.md](DESIGN.md); `app.css` and `app.js` are the shared implementation layer. The
+[DESIGN.md](../DESIGN.md); `app.css` and `app.js` are the shared implementation layer. The
 Library is now the primary browse/detail view, with Quick Crate, Review, Playlists, and
 Scout as persistent destinations.
 
@@ -33,6 +33,22 @@ The app code, static pages, and documentation are safe to commit. All personal c
 - `data/reports/<profile>/` — generated taste profiles and Seller Scout reports.
 
 See `data/README.md` for the complete map. Back up the local `data/` directory separately before moving to another computer; it is deliberately not part of the remote repository.
+
+### Repairing older identity data
+
+Older workspaces may use provisional artist/title text as the identity shared by photo
+review, listening review, and playlists. Preview the one-time canonical migration with:
+
+```bash
+python3 cue_crate.py migrate-library-identities --owner dj-one
+```
+
+If every evidence item resolves, apply it with `--apply`. Cue Crate first copies every
+metadata file it can change to `data/backups/identity-migration-*`. The migration links
+photo evidence to catalogue records, rebuilds the quick crate, preserves YouTube choices
+and provider receipts, and retargets local playlist membership. It does not call or modify
+Discogs, YouTube, or Spotify. A later `fetch-collection` also refreshes these local derived
+views so corrected catalogue metadata remains authoritative.
 
 ## Profiles and collectives
 
@@ -117,6 +133,12 @@ This removes stale Discogs API rows for that profile. It does not discard a
 record that has local photo-review evidence, a quick-crate marker, DJ notes,
 or a crate location; those records remain locally catalogued instead.
 
+A routine collection refresh preserves local playlist order, album/track modes,
+and saved Spotify review choices when membership identities have not changed.
+It does not replace a newer local setlist with an older published YouTube order,
+and never publishes new purchases automatically. Explicit identity migration can
+still recover membership from old publication receipts when repairing legacy state.
+
 ### Local phone companion
 
 The mobile MVP runs only on your local network. Install dependencies, then
@@ -127,12 +149,12 @@ python3 -m pip install -r requirements.txt
 python3 cue_crate.py serve --owner dj-one --lan
 ```
 
-Open the printed `connect.html` address on the Mac. It displays a one-time QR
+Open the printed `connect.html` address on the Mac. It displays a server-session QR
 code that opens the phone companion over Wi-Fi. The phone can browse the chosen
 profile's catalogue and upload front, back, label, and optional barcode close-up photos into
 `data/inbox/<profile-id>/<upload-id>/`. A primary evidence photo is the minimum;
 label, front-cover, and barcode close-up views are optional fallbacks. A barcode close-up should include both the bars and the complete number printed directly below them. Keep the service on a trusted network: this MVP
-uses a short-lived link token rather than a full account system. The token remains in
+uses a reusable link token valid until server restart rather than a full account system. The token remains in
 the URL fragment and is sent only as a request header; static serving is allowlisted so
 the server will not expose the local `data/` directory. Treat it as a trusted-LAN tool,
 not an Internet service.
@@ -145,11 +167,16 @@ python3 cue_crate.py analyse-intake --owner dj-one
 python3 cue_crate.py serve --owner dj-one
 ```
 
-The command sends all available views together to Kimi K2.6 by default, saves
+The command sends all available views together using the configured Go image model, saves
 the evidence in `data/workspace/<profile-id>/intake-review.json`, and adds one item
 to the existing review queue. It never writes to Discogs automatically. Use
 `--upload-id <id>` to select an older bundle, or `--refresh` to analyse an
 already processed bundle again.
+
+For a new capture cycle, prefer `analyse-intake --owner dj-one --all-pending --limit 3`:
+it processes only bundles without a saved analysis and leaves older reviews alone.
+See [phone intake and image models](phone-intake.md) for current model settings and
+the distinction between upload, analysis, review, and Discogs apply.
 
 Supply `--username` only when fetching a public collection owned by someone else.
 If you keep it under `/tmp`, recreate the file after a restart or cleanup removes temporary files.
@@ -158,13 +185,11 @@ If you keep it under `/tmp`, recreate the file after a restart or cleanup remove
 
 Do not keep a long-lived personal access token in `/tmp` or in this repository. The commands look for a token in this order: an explicit `--token-file`, `DISCOGS_TOKEN`, `~/.config/cue-crate/discogs-token`, then a **Keychain Access** Password item named `cue-crate.discogs-token`. Older local credential locations remain readable during the product rename. The newer macOS **Passwords** app may not expose a generic secret to the command-line Keychain interface, so use the per-user config file or duplicate the item in Keychain Access for dependable local automation. If using the config file, create its parent directory with mode `700` and the token file with mode `600`.
 
-To install a token file into the local macOS Keychain without putting it in shell history, run this once (the command does not print the token):
+To install the token privately in macOS Keychain, leave `-w` last and paste it at
+the password prompt, not in the command or process arguments:
 
 ```bash
-read -r token < /tmp/discogs-token
-security add-generic-password -U \
-  -s cue-crate.discogs-token -a "$USER" -w "$token"
-unset token
+security add-generic-password -U -s cue-crate.discogs-token -a "$USER" -w
 ```
 
 Verify that the item exists without displaying its secret:
@@ -173,7 +198,7 @@ Verify that the item exists without displaying its secret:
 security find-generic-password -s cue-crate.discogs-token >/dev/null
 ```
 
-Once verified, remove the temporary token file yourself. For a collaborator's private account token, use a separate Keychain item named `cue-crate.discogs-token-<profile-id>`; public collection imports do not require another person's token.
+Once verified, remove any temporary token file yourself. For a collaborator's private account token, use a separate Keychain item named `cue-crate.discogs-token.<profile-id>`; public collection imports can use your own stored token.
 
 ### 2. Identify your six-record photos
 
@@ -184,30 +209,24 @@ python3 -m pip install -r requirements.txt
 python3 cue_crate.py analyse-photos --owner dj-one --photo-dir '/path/to/record-photos'
 ```
 
-The photo commands use the OpenCode Go gateway.  They look for a credential in
-this order: `--api-key-file PATH`, `OPENCODE_GO_API_KEY`,
-`~/.config/cue-crate/opencode-go-api-key`, then the OpenCode login file at
-`~/.local/share/opencode/auth.json`.  The last location is where OpenCode
-stores the provider key after `/connect` or `opencode auth login`, so a normal
-OpenCode login is enough for a local run; the key is never copied into this
-repository.
+The photo commands use the OpenCode Go gateway. Prefer a dedicated Cue Crate key in
+macOS Keychain (`cue-crate.opencode-go-api-key`) or the per-app configuration store;
+see [credential setup and exact precedence](credentials.md#use-a-dedicated-cue-crate-key).
+The OpenCode login file remains a read-only compatibility fallback. No key is copied
+into this repository and installing a dedicated key does not change OpenCode's login.
 
-If OpenCode has not been connected yet, run `opencode auth login`, select
-OpenCode Go, and complete the browser sign-in.  To use a separate credential
-file instead, create it outside the repository with one key on one line and
-restrict it to your user account:
+To keep this separate from normal OpenCode use, follow the private Keychain prompt
+in the credential guide. A separate key file outside the repository is also supported;
+restrict it to your user account. Avoid putting real keys in shell command history:
 
 ```bash
-mkdir -p ~/.config/cue-crate
-umask 077
-printf '%s\n' 'YOUR_OPENCODE_GO_KEY' > ~/.config/cue-crate/opencode-go-api-key
 python3 cue_crate.py analyse-photos --owner dj-one --api-key-file ~/.config/cue-crate/opencode-go-api-key --photo-dir '/path/to/record-photos'
 ```
 
 An environment variable remains useful for temporary shells or automation:
 
 ```bash
-export OPENCODE_GO_API_KEY='…'
+export CUE_CRATE_OPENCODE_GO_API_KEY='…'
 ```
 
 The single-record phone-intake analyzer uses the same credential lookup:
@@ -216,19 +235,33 @@ The single-record phone-intake analyzer uses the same credential lookup:
 python3 cue_crate.py analyse-intake --owner dj-one
 ```
 
-Kimi K2.6 is the default provider. If it is temporarily unavailable, MiniMax M3 can use the same OpenCode Go key:
+Model aliases and endpoints are checked against Go's current public model catalog.
+Inspect it without sending images or running generation:
 
 ```bash
-python3 cue_crate.py analyse-photos --provider minimax --owner dj-one --photo-dir '/path/to/record-photos'
+python3 cue_crate.py photo-models --refresh
 ```
 
-The MiniMax fallback is experimental: its OpenCode Go text endpoint is confirmed, but the current gateway may reject image bodies. The command will stop with an explicit message rather than produce partial or guessed results.
+The routine default is MiMo V2.6 Flash; Kimi K3.1 Pro is an explicit slower second
+opinion, not an automatic fallback. Defaults live in `config/photo-analysis.example.json`; optional local overrides belong
+in the ignored `config/photo-analysis.local.json`. As of November 2026 the aliases
+point to Kimi K3.1 Pro, MiMo V2.6 Flash, MiniMax M3.1 Flash, and DeepSeek V4.1 Flash.
+These are metadata-verified candidates, not an accuracy ranking. The Go photo adapter
+uses `https://opencode.ai/inference/go/openai/v1`, not the retired hard-coded Zen route.
+It sends its own user agent and a stable per-analysis session ID, and omits request
+options a model does not advertise.
 
-MiMo V2.5 is an OpenAI-compatible alternative with documented base64 image input:
+Choose an alternative explicitly; the application never automatically switches hosts,
+models, or billing routes:
 
 ```bash
-python3 cue_crate.py analyse-photos --provider mimo --owner dj-one --photo-dir '/path/to/record-photos'
+python3 cue_crate.py analyse-intake --provider mimo --owner dj-one --all-pending --limit 3
 ```
+
+Keep Go's **Extra Usage off** if you do not want pay-as-you-go fallback on the provider
+side. An expired API key must be replaced in Console and reconfigured in OpenCode Go;
+an active subscription does not renew it. Go is documented as a coding-agent plan, so
+confirm eligibility for large photo batches with OpenCode. See the [photo guide](phone-intake.md).
 
 If a long batch is interrupted, resume without repeating already-saved grids:
 
@@ -301,6 +334,11 @@ This writes `data/workspace/<profile-id>/discogs-additions.local.json` (ignored 
 ```bash
 python3 cue_crate.py enrich --owner dj-one --token-file /tmp/discogs-token
 ```
+
+Without `--refresh`, enrichment fills only missing tracklists and leaves existing
+tracks, BPM values, and notes alone. The current `--refresh` option replaces a whole
+tracklist; do not use it on annotated tracks until metadata-preserving refresh is
+implemented. Existing annotations should be backed up before any deliberate replacement.
 
 ### 7a. Add BPM and key metadata
 
@@ -396,23 +434,37 @@ python3 cue_crate.py serve --owner dj-one
 
 Open `http://127.0.0.1:8765/playlists.html`. Use the **Profile** selector to
 switch between profiles represented in the local catalogue; playlist settings and
-track-review state stay in that profile's workspace. Use **Build this playlist from the
-library** to select records and arrange their order; the YouTube-backed representative
-track still gets curated in **Open track selector**. Existing YouTube publishing remains
-an explicit command so an
-OAuth browser sign-in and the final track list are always deliberate. Spotify is exposed
-as a destination slot and reports **Not connected** until a local Spotify credential is
-configured. For the current status check, use `SPOTIFY_ACCESS_TOKEN` or place the token
-in `~/.config/cue-crate/profiles/<profile-id>/spotify-oauth.json` with owner-only
-permissions; its publishing adapter is the next provider-specific increment.
+track-review state stay in that profile's workspace. Use the setlist builder to select
+records and arrange their order. YouTube publishing uses the curated representative-track
+review. Spotify uses a profile-specific PKCE login and automatically matches Discogs
+releases using artist, title, year, and tracklist evidence. Configure the Client ID and
+callback as described in `docs/credentials.md`, then connect the profile's Spotify account
+in the provider card.
+
+Spotify's match identity is cached separately in
+`data/library/playback-sources.json`. A high-confidence leader loads automatically in the
+Library; alternatives and their scoring evidence remain reviewable. An exact Spotify URL
+is available only as the advanced fallback. Provider data stays outside the canonical
+physical-copy records and the entire `data/` tree remains outside version control.
 
 Playlist membership is stored as an ordered `entries` list in each profile's
-`data/workspace/<profile-id>/playlists.json`; an entry can represent a whole album or an
-individual Discogs track. Older playlists without that field continue to mean “all
-approved, YouTube Music-verified album selections” until they are saved from the manager.
-The local setlist can contain individual tracks immediately, while provider publishing
-currently includes only selected albums with a verified provider track; per-track YouTube
-matching is the next provider-specific increment.
+`data/workspace/<profile-id>/playlists.json`; an entry can represent a record's curated
+song, a deliberately selected Discogs track, or—when explicitly switched—an entire album.
+Older album entries migrate to curated-song mode. Use **Prepare Spotify matches** to
+resolve every entry without changing the live Spotify playlist. Publishing stays disabled
+until the visible review queue is clear. Only entries explicitly marked **Full album**
+expand to a complete Spotify release; the default follows the representative selection
+already approved in the YouTube review.
+
+The Library uses Spotify's Web Playback SDK for full-length listening through the
+connected Premium account. It appears as a browser device named **Cue Crate** and uses the
+same local OAuth connection as publishing. The former embedded player is no longer the
+primary listening path.
+
+For standalone, theme-based playlists curated independently of the vinyl catalogue
+(for example, a genre or era playlist), see the separate
+[Themed Spotify playlist workflow](spotify-playlist-curation.md). It covers seed review,
+Spotify matching, publication approval, and post-publish verification.
 
 The existing YouTube review page remains available at
 `http://127.0.0.1:8765/youtube-review.html`.
@@ -466,4 +518,4 @@ The OAuth token is stored locally at `~/.config/cue-crate/profiles/<profile-id>/
 2. Additional collaborators can import a CSV or run the same command locally with their own token; no token needs to be shared.
 
 The deferred Spotify work, public-repository checklist, and the longer-term live-gig
-assistant idea are tracked in [`TODO.md`](TODO.md).
+assistant idea are tracked in [`TODO.md`](../TODO.md).

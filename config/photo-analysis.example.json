@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "provider": "mimo",
+  "models": {
+    "kimi": "kimi-k3.1-pro",
+    "mimo": "mimo-v2.6-flash",
+    "minimax": "minimax-m3.1-flash",
+    "deepseek": "deepseek-v4.1-flash"
+  },
+  "max_image_dimension": 2048,
+  "max_tokens": 8192
+}

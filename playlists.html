@@ -84,9 +84,9 @@
       function selectedEntries(playlist) {
         if (Array.isArray(playlist.entries)) return playlist.entries;
         if (Array.isArray(playlist.track_ids)) {
-          playlist.entries = playlist.track_ids.map(id => ({kind: 'album', id}));
+          playlist.entries = playlist.track_ids.map(id => ({kind: 'album', id, mode: 'representative'}));
         } else {
-          playlist.entries = (state?.track_options || []).filter(option => option.publish_ready).map(option => ({kind: 'album', id: option.id}));
+          playlist.entries = (state?.track_options || []).filter(option => option.publish_ready).map(option => ({kind: 'album', id: option.id, mode: 'representative'}));
         }
         return playlist.entries;
       }
@@ -105,18 +105,24 @@
       function addEntry(playlist, kind, id) {
         const entries = selectedEntries(playlist);
         if (entries.some(entry => entry.kind === kind && entry.id === id)) return;
-        playlist.entries = [...entries, kind === 'track' ? {kind, id, album_id: itemById(id)?.album_id || ''} : {kind, id}];
+        playlist.entries = [...entries, kind === 'track' ? {kind, id, album_id: itemById(id)?.album_id || ''} : {kind, id, mode: 'representative'}];
+        delete playlist.spotify_review;
         renderTrackManager(playlist);
+        renderSpotifyReview(playlist);
       }
       function removeEntry(playlist, index) {
         playlist.entries = selectedEntries(playlist).filter((_, entryIndex) => entryIndex !== index);
+        delete playlist.spotify_review;
         renderTrackManager(playlist);
+        renderSpotifyReview(playlist);
       }
       function reorderEntry(playlist, fromIndex, toIndex) {
         const entries = [...selectedEntries(playlist)];
         if (fromIndex < 0 || toIndex < 0 || fromIndex >= entries.length || toIndex >= entries.length || fromIndex === toIndex) return;
         const [entry] = entries.splice(fromIndex, 1); entries.splice(toIndex, 0, entry); playlist.entries = entries;
+        delete playlist.spotify_review;
         renderTrackManager(playlist);
+        renderSpotifyReview(playlist);
       }
       function renderLibrary(playlist) {
         const library = editor.querySelector('#playlist-library');
@@ -133,7 +139,7 @@
           const status = trackStatus(album); const open = expandedAlbums.has(album.id); const albumSelected = selected.has(`album:${album.id}`);
           const meta = [album.year, album.format, album.label].filter(Boolean).join(' · ') || 'Metadata unavailable';
           const tracks = open ? `<div class="playlist-library-tracks">${(album.tracks || []).length ? album.tracks.map(track => `<div class="playlist-library-track ${selected.has(`track:${track.id}`) ? 'is-selected' : ''}" draggable="true" data-drag-kind="track" data-drag-id="${esc(track.id)}"><span class="playlist-drag-handle" aria-hidden="true">⠿</span><span class="playlist-library-track__body"><strong>${esc(track.position)} · ${esc(track.title)}</strong><small>${esc([track.artist, track.duration].filter(Boolean).join(' · '))}</small></span><button type="button" class="button--quiet" data-add-kind="track" data-add-id="${esc(track.id)}">${selected.has(`track:${track.id}`) ? 'Added' : 'Add'}</button></div>`).join('') : '<div class="playlist-track-empty">No tracklist is cached for this release.</div>'}</div>` : '';
-          return `<div class="playlist-library-album ${albumSelected ? 'is-selected' : ''}" draggable="true" data-drag-kind="album" data-drag-id="${esc(album.id)}"><div class="playlist-library-album__row"><button type="button" class="playlist-expand" data-expand-album="${esc(album.id)}" aria-label="${open ? 'Collapse' : 'Expand'} ${esc(album.title)}">${open ? '▾' : '▸'}</button><span class="playlist-drag-handle" aria-hidden="true">⠿</span><span class="playlist-library-album__body"><strong>${esc(album.artist)} — ${esc(album.title)}</strong><small>${esc(meta)} · ${(album.tracks || []).length} tracks</small><span class="badge ${status.className}">${esc(status.label)}</span></span><button type="button" class="button--quiet" data-add-kind="album" data-add-id="${esc(album.id)}">${albumSelected ? 'Added' : 'Add album'}</button></div>${tracks}</div>`;
+          return `<div class="playlist-library-album ${albumSelected ? 'is-selected' : ''}" draggable="true" data-drag-kind="album" data-drag-id="${esc(album.id)}"><div class="playlist-library-album__row"><button type="button" class="playlist-expand" data-expand-album="${esc(album.id)}" aria-label="${open ? 'Collapse' : 'Expand'} ${esc(album.title)}">${open ? '▾' : '▸'}</button><span class="playlist-drag-handle" aria-hidden="true">⠿</span><span class="playlist-library-album__body"><strong>${esc(album.artist)} — ${esc(album.title)}</strong><small>${esc(meta)} · ${(album.tracks || []).length} tracks</small><span class="badge ${status.className}">${esc(status.label)}</span></span><button type="button" class="button--quiet" data-add-kind="album" data-add-id="${esc(album.id)}">${albumSelected ? 'Added' : 'Add curated pick'}</button></div>${tracks}</div>`;
         }).join('') : '<div class="playlist-track-empty">No library records match this search.</div>';
         library.querySelectorAll('[data-expand-album]').forEach(button => button.onclick = event => { event.stopPropagation(); const id = button.dataset.expandAlbum; expandedAlbums.has(id) ? expandedAlbums.delete(id) : expandedAlbums.add(id); renderLibrary(playlist); });
         library.querySelectorAll('[data-add-kind]').forEach(button => button.onclick = event => { event.stopPropagation(); addEntry(playlist, button.dataset.addKind, button.dataset.addId); });
@@ -148,8 +154,8 @@
           const item = itemById(entry.id); if (!item) return '';
           const album = entry.kind === 'track' ? itemById(item.album_id) : item;
           const title = entry.kind === 'track' ? `${item.position} · ${item.title}` : `${item.artist} — ${item.title}`;
-          const meta = entry.kind === 'track' ? `${item.artist || album?.artist || ''} · ${album?.title || ''}` : `Whole album · ${(item.tracks || []).length} tracks`;
-          return `<div class="playlist-setlist-row" draggable="true" data-entry-index="${index}"><span class="playlist-drag-handle" aria-hidden="true">⠿</span><span class="playlist-setlist-row__body"><strong>${esc(title)}</strong><small>${esc(meta)}</small></span><span class="playlist-selected-row__actions"><button type="button" data-move="up" data-index="${index}" aria-label="Move entry up" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" data-move="down" data-index="${index}" aria-label="Move entry down" ${index === entries.length - 1 ? 'disabled' : ''}>↓</button><button type="button" data-remove-entry="${index}" aria-label="Remove entry">×</button></span></div>`;
+          const meta = entry.kind === 'track' ? `${item.artist || album?.artist || ''} · ${album?.title || ''}` : entry.mode === 'full_album' ? `Full album · ${(item.tracks || []).length} tracks` : entry.mode === 'spotify_skip' ? 'Included on YouTube · skipped on Spotify' : 'Curated representative track';
+          return `<div class="playlist-setlist-row" draggable="true" data-entry-index="${index}"><span class="playlist-drag-handle" aria-hidden="true">⠿</span><span class="playlist-setlist-row__body"><strong>${esc(title)}</strong><small>${esc(meta)}</small></span><span class="playlist-selected-row__actions">${entry.kind === 'album' ? `<select data-entry-mode="${index}" aria-label="Spotify publishing mode for ${esc(title)}"><option value="representative" ${!['full_album', 'spotify_skip'].includes(entry.mode) ? 'selected' : ''}>Curated pick</option><option value="full_album" ${entry.mode === 'full_album' ? 'selected' : ''}>Full album</option><option value="spotify_skip" ${entry.mode === 'spotify_skip' ? 'selected' : ''}>Skip Spotify</option></select>` : ''}<button type="button" data-move="up" data-index="${index}" aria-label="Move entry up" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" data-move="down" data-index="${index}" aria-label="Move entry down" ${index === entries.length - 1 ? 'disabled' : ''}>↓</button><button type="button" data-remove-entry="${index}" aria-label="Remove entry">×</button></span></div>`;
         }).join('') : '<div class="playlist-track-empty">Drag an album or an individual track here to start the setlist.</div>';
         setlist.ondragenter = event => { event.preventDefault(); setlist.classList.add('is-dragover'); };
         setlist.ondragover = event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; setlist.classList.add('is-dragover'); };
@@ -158,6 +164,93 @@
         setlist.querySelectorAll('[data-entry-index]').forEach(row => row.ondragstart = event => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', JSON.stringify({kind: 'entry', index: Number(row.dataset.entryIndex)})); });
         setlist.querySelectorAll('[data-move]').forEach(button => button.onclick = () => reorderEntry(playlist, Number(button.dataset.index), Number(button.dataset.index) + (button.dataset.move === 'up' ? -1 : 1)));
         setlist.querySelectorAll('[data-remove-entry]').forEach(button => button.onclick = () => removeEntry(playlist, Number(button.dataset.removeEntry)));
+        setlist.querySelectorAll('[data-entry-mode]').forEach(select => select.onchange = () => {
+          playlist.entries[Number(select.dataset.entryMode)].mode = select.value;
+          delete playlist.spotify_review;
+          renderTrackManager(playlist);
+          renderSpotifyReview(playlist);
+        });
+      }
+      function renderSpotifyReview(playlist) {
+        const review = playlist.spotify_review;
+        const panel = editor.querySelector('#spotify-review-panel');
+        if (!panel) return;
+        if (!review) {
+          panel.innerHTML = '<div><p class="section-label">Spotify readiness</p><h3>Prepare before publishing</h3><p class="summary">Cue Crate will map each curated YouTube choice to its Discogs track, then to Spotify. Nothing is changed on Spotify during this check.</p></div>';
+          return;
+        }
+        const issues = (review.items || []).filter(item => item.status === 'needs_review');
+        const ready = (review.items || []).filter(item => item.status === 'ready');
+        const skipped = (review.items || []).filter(item => item.status === 'skipped');
+        const issueMarkup = issues.map(item => {
+          const candidates = (item.spotify_track_candidates || []).map(candidate => `<div class="spotify-review-candidate"><span><b>${esc(candidate.artist)} — ${esc(candidate.name)}</b><small>${esc(`${candidate.score || 0}% · ${(candidate.evidence || []).join(' · ')}`)}</small></span><a href="${esc(candidate.url)}" target="_blank" rel="noreferrer" aria-label="Open candidate in Spotify">Listen ↗</a><button type="button" class="button--quiet" data-use-spotify-track="${esc(candidate.id)}" data-entry-id="${esc(item.entry_id)}" data-release-id="${esc(item.discogs_release_id)}" data-track-id="${esc(item.spotify_target_track_id)}">Use this track</button></div>`).join('');
+          const representative = item.representative_track || {};
+          const searchValue = item.spotify_manual_query || [representative.artist || item.artist || item.album_artist, representative.title || item.title || item.album_title].filter(Boolean).join(' ');
+          const manualSearch = item.spotify_target_track_id ? `<div class="spotify-manual-search" data-spotify-search-row data-entry-id="${esc(item.entry_id)}"><label><span>Search Spotify manually</span><input type="search" maxlength="200" value="${esc(searchValue)}" placeholder="Artist and track title"></label><button type="button" class="button--quiet" data-search-spotify-track>Search</button></div>` : '';
+          return `<article><div class="spotify-review-issue"><span><b>${esc(item.artist || item.album_artist)} — ${esc(item.title || item.album_title)}</b><small>${esc(item.reason || 'Match confirmation required.')}</small></span><div class="spotify-review-issue__actions">${item.review_url ? `<a class="button button--quiet" href="${esc(item.review_url)}" target="_blank" rel="noreferrer">Review source →</a>` : ''}<button type="button" class="button--quiet" data-skip-spotify-entry="${esc(item.entry_id)}">No suitable Spotify match</button></div></div>${manualSearch}${candidates ? `<div class="spotify-review-candidates"><small>Possible Spotify tracks</small>${candidates}</div>` : ''}</article>`;
+        }).join('');
+        const readyMarkup = ready.map(item => `<li><span>${esc(item.album_artist || item.artist)} — ${esc(item.album_title || item.title)}</span><small>→ ${esc(item.spotify_track ? `${item.spotify_track.artist} — ${item.spotify_track.name}` : `${item.spotify_album?.artist || ''} — ${item.spotify_album?.name || ''}`)}</small></li>`).join('');
+        const skippedMarkup = skipped.length ? `<details class="spotify-review-ready"><summary>See the ${skipped.length} entries omitted from Spotify</summary><ol>${skipped.map(item => `<li><span>${esc(item.album_artist || item.artist)} — ${esc(item.album_title || item.title)}</span><button type="button" class="button--quiet" data-restore-spotify-entry="${esc(item.entry_id)}">Restore</button></li>`).join('')}</ol></details>` : '';
+        panel.innerHTML = `<div class="spotify-review__heading"><div><p class="section-label">Spotify readiness</p><h3>${issues.length ? `${issues.length} entr${issues.length === 1 ? 'y needs' : 'ies need'} review` : 'Ready to publish'}</h3><p class="summary">${ready.length} of ${review.total || 0} entries resolve to Spotify${skipped.length ? ` · ${skipped.length} explicitly omitted` : ''}${(review.items || []).some(item => item.mode === 'full_album') ? ' · full albums are marked explicitly' : ''}.</p></div><span class="badge ${issues.length ? 'badge--review' : 'badge--confirmed'}">${issues.length ? 'Review required' : 'Ready'}</span></div>${issues.length ? `<div class="spotify-review-list">${issueMarkup}</div>` : `<details class="spotify-review-ready"><summary>See the ${ready.length} prepared tracks</summary><ol>${readyMarkup}</ol></details>`}${skippedMarkup}`;
+        panel.querySelectorAll('[data-use-spotify-track]').forEach(button => button.onclick = () => useSpotifyTrackCandidate(playlist, button));
+        panel.querySelectorAll('[data-search-spotify-track]').forEach(button => button.onclick = () => searchSpotifyTracks(playlist, button.closest('[data-spotify-search-row]')));
+        panel.querySelectorAll('[data-skip-spotify-entry]').forEach(button => button.onclick = () => setSpotifyOmission(playlist, button.dataset.skipSpotifyEntry, true));
+        panel.querySelectorAll('[data-restore-spotify-entry]').forEach(button => button.onclick = () => setSpotifyOmission(playlist, button.dataset.restoreSpotifyEntry, false));
+      }
+      async function useSpotifyTrackCandidate(playlist, button) {
+        const notice = document.querySelector('#editor-notice');
+        button.disabled = true;
+        if (notice) notice.textContent = 'Confirming track and refreshing the review…';
+        const response = await cueCrateFetch(ownerApiUrl('/api/playlists'), {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            action: 'select_spotify_track', id: playlist.id,
+            entry_id: button.dataset.entryId,
+            release_id: button.dataset.releaseId, track_id: button.dataset.trackId,
+            spotify_id: button.dataset.useSpotifyTrack,
+          }),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          button.disabled = false;
+          if (notice) notice.textContent = body.error || 'Could not confirm that Spotify track.';
+          return;
+        }
+        state = body; render();
+        const refreshed = activePlaylist()?.spotify_review;
+        const refreshedNotice = document.querySelector('#editor-notice');
+        if (refreshedNotice) refreshedNotice.textContent = `${refreshed?.ready || 0} ready; ${refreshed?.needs_review || 0} still need review.`;
+      }
+      async function searchSpotifyTracks(playlist, row) {
+        const notice = document.querySelector('#editor-notice');
+        const input = row?.querySelector('input'); const button = row?.querySelector('button');
+        const query = input?.value.trim() || '';
+        if (!query) { if (notice) notice.textContent = 'Enter an artist or track title first.'; return; }
+        if (button) button.disabled = true;
+        if (notice) notice.textContent = `Searching Spotify for “${query}”…`;
+        const response = await cueCrateFetch(ownerApiUrl('/api/playlists'), {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({action: 'search_spotify_track', id: playlist.id, entry_id: row.dataset.entryId, query}),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) { if (button) button.disabled = false; if (notice) notice.textContent = body.error || 'Spotify search failed.'; return; }
+        state = body; render();
+        const searchedNotice = document.querySelector('#editor-notice');
+        if (searchedNotice) searchedNotice.textContent = 'Spotify search results are ready for review.';
+      }
+      async function setSpotifyOmission(playlist, entryId, omitted) {
+        const notice = document.querySelector('#editor-notice');
+        if (notice) notice.textContent = omitted ? 'Marking this entry as omitted from Spotify…' : 'Restoring this entry…';
+        const response = await cueCrateFetch(ownerApiUrl('/api/playlists'), {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({action: 'set_spotify_omission', id: playlist.id, entry_id: entryId, omitted}),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) { if (notice) notice.textContent = body.error || 'Could not update the Spotify omission.'; return; }
+        state = body; render();
+        const refreshed = activePlaylist()?.spotify_review;
+        const updatedNotice = document.querySelector('#editor-notice');
+        if (updatedNotice) updatedNotice.textContent = omitted ? `${refreshed?.needs_review || 0} entries still need review.` : 'Entry restored. Prepare Spotify matches again to reassess it.';
       }
       function renderTrackManager(playlist) {
         const manager = editor.querySelector('#playlist-track-manager');
@@ -176,7 +269,8 @@
         const selected = (playlist.destinations || []).includes(provider);
         const destination = playlist[provider] || {};
         const status = destination.status === 'published' ? 'Published' : info.available ? 'Connected' : 'Not connected';
-        return `<label class="provider-card ${selected ? 'is-selected' : ''} ${info.available ? '' : 'is-unavailable'}"><input type="checkbox" name="destination" value="${provider}" ${selected ? 'checked' : ''} ${info.available ? '' : 'disabled'}><span class="provider-card__body"><span class="provider-card__top"><strong>${esc(info.label)}</strong><span class="badge ${destination.status === 'published' ? 'badge--confirmed' : info.available ? 'badge--accent' : 'badge--muted'}">${status}</span></span><small>${esc(info.detail)}</small>${destination.url ? `<a href="${esc(destination.url)}" target="_blank" rel="noreferrer">Open published playlist ↗</a>` : ''}</span></label>`;
+        const connectUrl = info.connect_url ? new URL(info.connect_url, ownerServiceOrigin).href : '';
+        return `<label class="provider-card ${selected ? 'is-selected' : ''} ${info.available ? '' : 'is-unavailable'}"><input type="checkbox" name="destination" value="${provider}" ${selected ? 'checked' : ''} ${info.available ? '' : 'disabled'}><span class="provider-card__body"><span class="provider-card__top"><strong>${esc(info.label)}</strong><span class="badge ${destination.status === 'published' ? 'badge--confirmed' : info.available ? 'badge--accent' : 'badge--muted'}">${status}</span></span><small>${esc(info.detail)}</small>${!info.available && info.configured && connectUrl ? `<a href="${esc(connectUrl)}">Connect Spotify account →</a>` : ''}${info.available && provider === 'spotify' && connectUrl ? `<a href="${esc(connectUrl)}">Reconnect with another account →</a>` : ''}${destination.url ? `<a href="${esc(destination.url)}" target="_blank" rel="noreferrer">Open published playlist ↗</a>` : ''}</span></label>`;
       }
       function renderEditor() {
         const playlist = (state?.playlists || []).find(item => item.id === activeId);
@@ -184,7 +278,7 @@
           editor.innerHTML = '<div class="empty-state"><div><strong>Choose a playlist to edit.</strong><p>Use New to start another listening list.</p></div></div>';
           return;
         }
-        editor.innerHTML = `<div class="playlist-editor__header"><div><p class="section-label">Playlist identity</p><h2>${esc(playlist.name || 'Untitled playlist')}</h2><p class="summary">${esc(playlist.track_count || 0)} approved YouTube selections · ${esc(playlist.automatic_track_count || 0)} automatic candidates available</p></div><span class="chip">${esc(playlist.visibility || 'unlisted')}</span></div><form id="playlist-form"><input type="hidden" name="id" value="${esc(playlist.id)}"><label class="form-field"><span>Name</span><input name="name" maxlength="160" value="${esc(playlist.name || '')}" placeholder="Saturday night crate"></label><label class="form-field"><span>Description</span><textarea name="description" maxlength="1000" placeholder="What is this list for?">${esc(playlist.description || '')}</textarea></label><label class="form-field"><span>Visibility</span><select name="visibility"><option value="private" ${playlist.visibility === 'private' ? 'selected' : ''}>Private</option><option value="unlisted" ${playlist.visibility === 'unlisted' || !playlist.visibility ? 'selected' : ''}>Unlisted</option><option value="public" ${playlist.visibility === 'public' ? 'selected' : ''}>Public</option></select></label><div class="form-field"><span>Deploy to</span><div class="provider-grid">${renderProviderCard('youtube', playlist)}${renderProviderCard('spotify', playlist)}</div><small class="form-help">A provider is shown here only when its local credentials are available. Your tokens never leave the local service.</small></div><div class="playlist-source-card"><div><p class="section-label">Track source</p><strong>YouTube track review</strong><p class="summary">Approve representative tracks there first; this manager stores the destination choices and playlist identity.</p></div><a class="button button--quiet" href="youtube-review.html">Open track selector ↗</a></div><div class="playlist-editor__actions"><button type="submit" class="button--primary">Save playlist</button><button id="deploy-youtube" type="button" class="button--quiet" ${providerStatus('youtube').available && (playlist.destinations || []).includes('youtube') ? '' : 'disabled'}>Publish YouTube</button><button id="deploy-spotify" type="button" class="button--quiet" disabled>Publish Spotify</button><button id="delete-playlist" type="button" class="button--danger">Delete</button><span id="editor-notice" class="notice" role="status"></span></div></form>`;
+        editor.innerHTML = `<div class="playlist-editor__header"><div><p class="section-label">Playlist identity</p><h2>${esc(playlist.name || 'Untitled playlist')}</h2><p class="summary">${esc(playlist.track_count || 0)} approved YouTube selections · ${esc(playlist.automatic_track_count || 0)} automatic candidates available</p></div><span class="chip">${esc(playlist.visibility || 'unlisted')}</span></div><form id="playlist-form"><input type="hidden" name="id" value="${esc(playlist.id)}"><div class="playlist-identity-fields"><label class="form-field"><span>Name</span><input name="name" maxlength="160" value="${esc(playlist.name || '')}" placeholder="Saturday night crate"></label><label class="form-field"><span>Visibility</span><select name="visibility"><option value="private" ${playlist.visibility === 'private' ? 'selected' : ''}>Private</option><option value="unlisted" ${playlist.visibility === 'unlisted' || !playlist.visibility ? 'selected' : ''}>Unlisted</option><option value="public" ${playlist.visibility === 'public' ? 'selected' : ''}>Public</option></select></label><label class="form-field form-field--wide"><span>Description</span><textarea name="description" maxlength="1000" placeholder="What is this list for?">${esc(playlist.description || '')}</textarea></label></div><div class="form-field"><span>Deploy to</span><div class="provider-grid">${renderProviderCard('youtube', playlist)}${renderProviderCard('spotify', playlist)}</div><small class="form-help">A provider is shown here only when its local credentials are available. Your tokens never leave the local service.</small></div><div class="playlist-source-card"><div><p class="section-label">Track source</p><strong>YouTube track review</strong><p class="summary">Approve representative tracks there first; Spotify preparation mirrors those choices instead of expanding albums.</p></div><a class="button button--quiet" href="youtube-review.html">Open track selector ↗</a></div><section id="spotify-review-panel" class="spotify-review surface"></section><div class="playlist-editor__actions"><div class="playlist-action-group"><button type="submit" class="button--primary">Save playlist</button><span id="editor-notice" class="notice" role="status"></span></div><div class="playlist-action-group playlist-action-group--publish"><p class="section-label">Publish to your destinations</p><button id="deploy-youtube" type="button" ${providerStatus('youtube').available && (playlist.destinations || []).includes('youtube') ? '' : 'disabled'}>Publish YouTube</button><button id="prepare-spotify" type="button">Prepare Spotify matches</button><button id="deploy-spotify" type="button" disabled>Publish Spotify</button></div><div class="playlist-action-group playlist-action-group--danger"><button id="delete-playlist" type="button" class="button--danger">Delete playlist</button></div></div></form>`;
         const trackSelector = editor.querySelector('.playlist-source-card a');
         if (trackSelector) trackSelector.href = `youtube-review.html?owner=${encodeURIComponent(currentOwner)}`;
         const editorSummary = editor.querySelector('.playlist-editor__header .summary');
@@ -194,29 +288,66 @@
           const trackManager = document.createElement('section');
           trackManager.id = 'playlist-track-manager';
           trackManager.className = 'playlist-track-manager';
-          trackManager.innerHTML = `<div class="playlist-track-manager__header"><div><p class="section-label">Setlist builder</p><h3>Drag records or tracks into the set</h3><p class="summary">Drag an album for a whole-release entry, or expand it and drag individual tracks. Buttons remain available for touch devices.</p></div><span id="playlist-selected-count" class="badge badge--accent"></span></div><div class="playlist-builder"><div class="playlist-library-panel"><label class="form-field"><span>Library</span><input id="playlist-track-filter" class="playlist-track-manager__filter" type="search" placeholder="Search artist, title, label…" aria-label="Search library tracks"></label><div id="playlist-library" class="playlist-library"></div></div><div class="playlist-setlist-panel"><div class="playlist-setlist-heading"><p class="section-label">Listening order</p><small>Drop here</small></div><div id="playlist-setlist" class="playlist-setlist"></div></div></div>`;
+          trackManager.innerHTML = `<div class="playlist-track-manager__header"><div><p class="section-label">Setlist builder</p><h3>Drag records or tracks into the set</h3><p class="summary">A record uses its curated representative song by default. Expand it to choose a specific track, or explicitly switch an entry to Full album.</p></div><span id="playlist-selected-count" class="badge badge--accent"></span></div><div class="playlist-builder"><div class="playlist-library-panel"><label class="form-field"><span>Library</span><input id="playlist-track-filter" class="playlist-track-manager__filter" type="search" placeholder="Search artist, title, label…" aria-label="Search library tracks"></label><div id="playlist-library" class="playlist-library"></div></div><div class="playlist-setlist-panel"><div class="playlist-setlist-heading"><div><p class="section-label">Listening order</p><span class="form-help">Drag to reorder, or use the arrows on each entry.</span></div><small>Drop here</small></div><div id="playlist-setlist" class="playlist-setlist"></div></div></div>`;
           sourceCard.after(trackManager);
           renderTrackManager(playlist);
         }
+        renderSpotifyReview(playlist);
         document.querySelector('#playlist-form').onsubmit = savePlaylist;
         document.querySelector('#delete-playlist').onclick = deletePlaylist;
-        editor.querySelectorAll('input[name="destination"]').forEach(input => input.onchange = () => { input.closest('.provider-card').classList.toggle('is-selected', input.checked); updateDeployButtons(); });
+        editor.querySelectorAll('input[name="destination"]').forEach(input => input.onchange = () => {
+          input.closest('.provider-card').classList.toggle('is-selected', input.checked);
+          playlist.destinations = [...editor.querySelectorAll('input[name="destination"]:checked')].map(control => control.value);
+          const notice = document.querySelector('#editor-notice');
+          if (notice) notice.textContent = input.checked ? `${providerNames[input.value]} selected.${input.value === 'spotify' ? ' Next, prepare its track matches.' : ' You can publish now or save the playlist.'}` : `${providerNames[input.value]} destination removed; save to keep this change.`;
+          updateDeployButtons();
+        });
         updateDeployButtons();
       }
       function updateDeployButtons() {
         const playlist = (state?.playlists || []).find(item => item.id === activeId);
+        const selected = provider => Boolean(editor.querySelector(`input[name="destination"][value="${provider}"]`)?.checked);
         const youtube = document.querySelector('#deploy-youtube');
-        if (youtube) youtube.disabled = !playlist || !providerStatus('youtube').available || !(playlist.destinations || []).includes('youtube');
+        if (youtube) youtube.disabled = !playlist || !providerStatus('youtube').available || !selected('youtube');
+        const spotify = document.querySelector('#deploy-spotify');
+        const spotifyPrepared = playlist?.spotify_review && playlist.spotify_review.needs_review === 0;
+        if (spotify) {
+          spotify.disabled = !playlist || !providerStatus('spotify').available || !selected('spotify') || !spotifyPrepared;
+          const unresolved = playlist?.spotify_review?.needs_review;
+          spotify.title = !providerStatus('spotify').available ? 'Connect Spotify first.' : !selected('spotify') ? 'Select Spotify as a destination first.' : !playlist?.spotify_review ? 'Prepare Spotify matches first.' : unresolved ? `Resolve or omit ${unresolved} remaining ${unresolved === 1 ? 'entry' : 'entries'} first.` : 'Ready to publish to Spotify.';
+        }
+        const prepareSpotify = document.querySelector('#prepare-spotify');
+        if (prepareSpotify) prepareSpotify.disabled = !playlist || !providerStatus('spotify').available || !selected('spotify');
+      }
+      async function prepareSpotifyPlaylist() {
+        const notice = document.querySelector('#editor-notice');
+        if (!notice) return;
+        notice.textContent = 'Saving the setlist before matching…';
+        if (!await persistActivePlaylist(false)) return;
+        notice.textContent = 'Matching curated songs to Spotify…';
+        const response = await cueCrateFetch(ownerApiUrl('/api/playlists'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'prepare_spotify', id: activeId})});
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) { notice.textContent = body.error || 'Could not prepare Spotify matches.'; return; }
+        state = body; render();
+        const updated = activePlaylist()?.spotify_review;
+        const updatedNotice = document.querySelector('#editor-notice');
+        if (updatedNotice) updatedNotice.textContent = updated?.needs_review ? `${updated.ready} ready; ${updated.needs_review} need review before publishing.` : `${updated?.ready || 0} representative tracks are ready to publish.`;
       }
       async function deployPlaylist(provider) {
         const notice = document.querySelector('#editor-notice');
         if (!notice) return;
         notice.textContent = `Publishing to ${providerNames[provider]}…`;
-        const response = await fetch(ownerApiUrl('/api/playlists'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'deploy', id: activeId, provider})});
+        const response = await cueCrateFetch(ownerApiUrl('/api/playlists'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'deploy', id: activeId, provider})});
         const body = await response.json().catch(() => ({}));
         if (!response.ok) { notice.textContent = body.error || `Could not publish to ${providerNames[provider]}.`; return; }
         state = body; render();
-        const deployedNotice = document.querySelector('#editor-notice'); if (deployedNotice) deployedNotice.textContent = body.deployment?.track_entries_pending ? `${providerNames[provider]} playlist updated; ${body.deployment.track_entries_pending} individual track entr${body.deployment.track_entries_pending === 1 ? 'y is' : 'ies are'} still awaiting provider matching.` : `${providerNames[provider]} playlist updated.`;
+        const deployedNotice = document.querySelector('#editor-notice');
+        if (deployedNotice) {
+          if (body.deployment?.replaced_unavailable_playlist_id) deployedNotice.textContent = `${providerNames[provider]} could not access the previous playlist, so Cue Crate created a replacement with ${body.deployment.published || 0} tracks.`;
+          else if (body.deployment?.track_entries_pending) deployedNotice.textContent = `${providerNames[provider]} playlist updated; ${body.deployment.track_entries_pending} individual track entr${body.deployment.track_entries_pending === 1 ? 'y is' : 'ies are'} still awaiting provider matching.`;
+          else if (body.deployment?.skipped?.length) deployedNotice.textContent = `${providerNames[provider]} playlist updated with ${body.deployment.published || 0} tracks; ${body.deployment.skipped.length} entr${body.deployment.skipped.length === 1 ? 'y needs' : 'ies need'} review.`;
+          else deployedNotice.textContent = `${providerNames[provider]} playlist updated${body.deployment?.published ? ` with ${body.deployment.published} tracks` : ''}.`;
+        }
       }
       function render() {
         ownerBadge.textContent = `${state.owner} · ${state.track_review?.approved || 0} approved tracks`;
@@ -227,30 +358,41 @@
         const draft = {id: `draft-${Date.now()}`, name: 'New vinyl set', description: '', visibility: 'unlisted', destinations: [], source: 'youtube-review', entries: [], track_ids: [], youtube: {status: 'ready'}, spotify: {status: 'not_connected'}, track_count: 0, automatic_track_count: 0};
         state.playlists = [...state.playlists, draft]; activeId = draft.id; render();
       }
+      async function persistActivePlaylist(renderAfter = true) {
+        const form = document.querySelector('#playlist-form');
+        if (!form) return false;
+        const values = new FormData(form); const destinations = [...form.querySelectorAll('input[name="destination"]:checked')].map(input => input.value); const playlist = activePlaylist();
+        const notice = document.querySelector('#editor-notice');
+        const response = await cueCrateFetch(ownerApiUrl('/api/playlists'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: values.get('id'), name: values.get('name'), description: values.get('description'), visibility: values.get('visibility'), destinations, entries: playlist ? selectedEntries(playlist) : []})});
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) { if (notice) notice.textContent = body.error || 'Could not save playlist.'; return false; }
+        state = body; activeId = body.saved_id || state.playlists.find(item => item.name === values.get('name'))?.id || activeId;
+        if (renderAfter) {
+          render();
+          const savedNotice = document.querySelector('#editor-notice'); if (savedNotice) savedNotice.textContent = 'Saved locally.';
+        }
+        return true;
+      }
       async function savePlaylist(event) {
         event.preventDefault();
-        const form = event.currentTarget; const values = new FormData(form); const destinations = [...form.querySelectorAll('input[name="destination"]:checked')].map(input => input.value); const playlist = activePlaylist();
-        const notice = document.querySelector('#editor-notice'); notice.textContent = 'Saving…';
-        const response = await fetch(ownerApiUrl('/api/playlists'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: values.get('id'), name: values.get('name'), description: values.get('description'), visibility: values.get('visibility'), destinations, entries: playlist ? selectedEntries(playlist) : []})});
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok) { notice.textContent = body.error || 'Could not save playlist.'; return; }
-        state = body; activeId = body.saved_id || state.playlists.find(item => item.name === values.get('name'))?.id || activeId; render();
-        const savedNotice = document.querySelector('#editor-notice'); if (savedNotice) savedNotice.textContent = 'Saved locally.';
+        const notice = document.querySelector('#editor-notice'); if (notice) notice.textContent = 'Saving…';
+        await persistActivePlaylist(true);
       }
       async function deletePlaylist() {
         const playlist = state.playlists.find(item => item.id === activeId); if (!playlist || !confirm(`Delete “${playlist.name}”?`)) return;
-        const response = await fetch(ownerApiUrl('/api/playlists'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'delete', id: playlist.id})});
+        const response = await cueCrateFetch(ownerApiUrl('/api/playlists'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: 'delete', id: playlist.id})});
         const body = await response.json().catch(() => ({})); if (!response.ok) { alert(body.error || 'Could not delete playlist.'); return; }
         state = body; activeId = state.playlists[0]?.id || ''; render();
       }
       document.querySelector('#new-playlist').onclick = newPlaylist;
       document.addEventListener('click', event => {
         if (event.target.id === 'deploy-youtube') deployPlaylist('youtube');
+        if (event.target.id === 'prepare-spotify') prepareSpotifyPlaylist();
         if (event.target.id === 'deploy-spotify') deployPlaylist('spotify');
       });
       document.querySelectorAll('[data-provider]').forEach(button => button.onclick = () => { providerFilter = button.dataset.provider; document.querySelectorAll('[data-provider]').forEach(tab => tab.setAttribute('aria-selected', String(tab === button))); renderList(); if (!visiblePlaylists().some(item => item.id === activeId)) { activeId = visiblePlaylists()[0]?.id || ''; renderEditor(); } });
       async function load() {
-        const response = await fetch(ownerApiUrl('/api/playlists'));
+        const response = await cueCrateFetch(ownerApiUrl('/api/playlists'));
         const contentType = response.headers.get('content-type') || '';
         if (!response.ok || !contentType.toLowerCase().includes('application/json')) {
           throw new Error('The playlist manager is connected to the wrong local service.');
@@ -259,7 +401,7 @@
         if (payload.error) throw new Error(payload.error);
         state = payload;
         activeId = state.playlists[0]?.id || '';
-        const ownersResponse = await fetch(ownerApiUrl('/api/owners'));
+        const ownersResponse = await cueCrateFetch(ownerApiUrl('/api/owners'));
         const ownersType = ownersResponse.headers.get('content-type') || '';
         if (!ownersResponse.ok || !ownersType.toLowerCase().includes('application/json')) throw new Error('Could not load local profiles.');
         const ownersPayload = await ownersResponse.json();

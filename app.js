@@ -1,3 +1,34 @@
+// Only deliberate same-origin desktop writes receive the in-memory session capability.
+// Never retry a mutation automatically: publishing may already have reached a provider.
+(() => {
+  let sessionPromise;
+  window.cueCrateFetch = async (input, options = {}) => {
+    const url = new URL(input, location.href);
+    if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) {
+      throw new Error('Cue Crate requests must use this local app origin.');
+    }
+    const method = String(options.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      if (!sessionPromise) {
+        sessionPromise = fetch('/api/session', {cache: 'no-store'}).then(async response => {
+          if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) {
+            throw new Error('Could not open a local session. Restart the Cue Crate server and reload.');
+          }
+          const session = await response.json();
+          if (!session.csrf_token) throw new Error('Local session unavailable. Reload Cue Crate.');
+          return session.csrf_token;
+        }).catch(error => { sessionPromise = null; throw error; });
+      }
+      const headers = new Headers(options.headers || {});
+      headers.set('X-Cue-Crate-CSRF', await sessionPromise);
+      options = {...options, headers};
+    }
+    const response = await fetch(url, {...options, credentials: 'same-origin'});
+    if (response.status === 403) sessionPromise = null;
+    return response;
+  };
+})();
+
 (() => {
   const target = document.querySelector('[data-app-shell]');
   if (!target) return;

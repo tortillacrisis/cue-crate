@@ -1,5 +1,9 @@
 # Getting started
 
+Use Python 3.12+ and a modern browser. Photo conversion currently requires macOS;
+the text-based catalogue and mocked provider tests do not require macOS tools.
+Install the dependencies using the root [quick start](../README.md#quick-start).
+
 Cue Crate has one normal runtime command. It starts the complete local app—Library,
 Review, Playlists, and Scout—on one port.
 
@@ -50,10 +54,10 @@ Use the LAN option only on a trusted home or studio network:
 .venv/bin/python cue_crate.py serve --owner dj-one --lan
 ```
 
-The command prints a **Phone connect screen** URL for the serving computer. It creates a
-one-time QR link to the phone companion. The phone can browse only the active profile's
+The command prints a **Phone connect screen** URL for the serving computer. Its QR link
+can be reused for that server session; restart the server to invalidate it. The phone can browse only the active profile's
 catalogue and upload intake photos; Library, Review, Playlists, and Scout APIs remain
-loopback-only.
+loopback-only. Stay on trusted Wi-Fi: this local HTTP link is not encrypted.
 
 For detailed import, photo-review, and provider workflows, see the
-[operations reference](operations.md).
+[phone intake guide](phone-intake.md) and [operations reference](operations.md).

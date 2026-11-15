@@ -40,7 +40,7 @@
       const reviewServiceOrigin = location.protocol === 'file:' ? 'http://127.0.0.1:8765' : location.origin;
       const apiUrl = path => { const url = new URL(path, reviewServiceOrigin); if (owner) url.searchParams.set('owner', owner); return url.href; };
       async function load() {
-        const response = await fetch(apiUrl('/api/youtube-music-review'));
+        const response = await cueCrateFetch(apiUrl('/api/youtube-music-review'));
         const contentType = response.headers.get('content-type') || '';
         if (!response.ok || !contentType.includes('application/json')) {
           throw new Error('Playlist review needs the local Cue Crate server.');
@@ -62,7 +62,7 @@
           <article class="surface playlist-card status-${escape(item.match_status)}" data-id="${escape(item.id)}">
             <div class="playlist-card__top"><div><h2>${escape(item.artist)} — ${escape(item.title)}</h2><p class="playlist-card__meta">${escape([item.year || 'year unknown', item.format || 'format unknown', item.label || 'label unknown'].join(' · '))}</p></div><span class="badge ${statusClass(item.match_status)}">${statusLabel(item.match_status)}</span></div>
             <div class="link-list"><a href="${escape(item.youtube_search_url)}" target="_blank" rel="noreferrer">Search YouTube ↗</a><a href="${escape(item.youtube_music_search_url)}" target="_blank" rel="noreferrer">Search YouTube Music ↗</a>${item.selected_video_id ? `<a href="https://music.youtube.com/watch?v=${escape(item.selected_video_id)}" target="_blank" rel="noreferrer">Open selection in Music ↗</a>` : ''}${item.discogs_url ? `<a href="${escape(item.discogs_url)}" target="_blank" rel="noreferrer">Discogs ↗</a>` : ''}</div>
-            <div class="playlist-edit"><label class="visually-hidden">Selected YouTube URL</label><input class="video-url" value="${escape(item.selected_video_url)}" placeholder="Paste YouTube or YouTube Music video URL"><label class="visually-hidden">Review status</label><select class="match-status"><option value="unmatched" ${item.match_status==='unmatched'?'selected':''}>Needs match</option><option value="auto_selected" ${item.match_status==='auto_selected'?'selected':''}>Auto-selected — check Music</option><option value="approved" ${item.match_status==='approved'?'selected':''}>Approved</option><option value="rejected" ${item.match_status==='rejected'?'selected':''}>No suitable upload</option></select><label class="visually-hidden">Selection note</label><textarea class="note" placeholder="Optional: upload, version, or track-choice note">${escape(item.note)}</textarea></div>
+            <div class="playlist-edit"><label class="control-field"><span>Selected YouTube URL</span><input class="video-url" value="${escape(item.selected_video_url)}" placeholder="Paste YouTube or YouTube Music video URL"></label><label class="control-field"><span>Review status</span><select class="match-status"><option value="unmatched" ${item.match_status==='unmatched'?'selected':''}>Needs match</option><option value="auto_selected" ${item.match_status==='auto_selected'?'selected':''}>Auto-selected — check Music</option><option value="approved" ${item.match_status==='approved'?'selected':''}>Approved</option><option value="rejected" ${item.match_status==='rejected'?'selected':''}>No suitable upload</option></select></label><label class="control-field control-field--wide"><span>Selection note</span><textarea class="note" placeholder="Optional: upload, version, or track-choice note">${escape(item.note)}</textarea></label></div>
             <div class="playlist-card__verify"><label class="check"><input class="music-verified" type="checkbox" ${item.youtube_music_verified ? 'checked' : ''}> I opened this exact selection in YouTube Music and it plays there.</label></div>
             <div class="playlist-card__actions"><button class="save button--primary" type="button">Save selection</button><span class="notice"></span></div>
           </article>`).join('') : '<div class="empty-state"><div><strong>No tracks match those filters.</strong>Choose a different status or search term.</div></div>';
@@ -74,7 +74,7 @@
         const notice = card.querySelector('.notice');
         const payload = {id: item.id, selected_video_url: card.querySelector('.video-url').value, match_status: card.querySelector('.match-status').value, youtube_music_verified: card.querySelector('.music-verified').checked, note: card.querySelector('.note').value};
         notice.textContent = 'Saving…';
-        const response = await fetch(apiUrl('/api/youtube-music-review'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({...payload, owner})});
+        const response = await cueCrateFetch(apiUrl('/api/youtube-music-review'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({...payload, owner})});
         const body = await response.json();
         if (!response.ok) { notice.textContent = body.error || 'Could not save.'; return; }
         Object.assign(item, body.item); notice.textContent = 'Saved locally.'; setTimeout(render, 280);

@@ -5,6 +5,7 @@ import argparse
 import base64
 import csv
 import difflib
+import hashlib
 import ipaddress
 import io
 import mimetypes
@@ -14,6 +15,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +34,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from local_http import LocalHTTPServer, LocalRequestHandler
+
+from photo_analysis import (
+    DEFAULT_MODELS, DEFAULT_PHOTO_PROVIDER, GO_CHAT_BASE_URL, PhotoProviderError, complete_photo, load_model_catalog,
+    load_photo_config, photo_model_settings, supports_images,
+)
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -47,7 +56,9 @@ DISCOGS_CACHE_DIR = CACHE_DIR / "discogs"
 SELLER_CACHE_DIR = CACHE_DIR / "sellers"
 GETSONGBPM_CACHE_PATH = CACHE_DIR / "getsongbpm-search.json"
 REPORTS_DIR = DATA_DIR / "reports"
+BACKUPS_DIR = DATA_DIR / "backups"
 CATALOG_PATH = LIBRARY_DIR / "catalog.json"
+PLAYBACK_SOURCES_PATH = LIBRARY_DIR / "playback-sources.json"
 RELEASE_FEATURES_PATH = DISCOGS_CACHE_DIR / "release-features.json"
 QUICK_CRATES_DIR = LIBRARY_DIR / "quick-crates"
 AGGREGATE_QUICK_CRATE_PATH = LIBRARY_DIR / "quick-crate.json"
@@ -68,13 +79,32 @@ GETSONGBPM_KEYCHAIN_SERVICE = "cue-crate.getsongbpm-api-key"
 LEGACY_GETSONGBPM_KEYCHAIN_SERVICE = "vinyl-crate.getsongbpm-api-key"
 GETSONGBPM_CONFIG_PATH = LOCAL_CONFIG_DIR / "getsongbpm-api-key"
 LEGACY_GETSONGBPM_CONFIG_PATH = LEGACY_LOCAL_CONFIG_DIR / "getsongbpm-api-key"
+SPOTIFY_CLIENT_ID_CONFIG_PATH = LOCAL_CONFIG_DIR / "spotify-client-id"
 OPENCODE_GO_CONFIG_PATH = LOCAL_CONFIG_DIR / "opencode-go-api-key"
+OPENCODE_GO_KEYCHAIN_SERVICE = "cue-crate.opencode-go-api-key"
 LEGACY_OPENCODE_GO_CONFIG_PATH = LEGACY_LOCAL_CONFIG_DIR / "opencode-go-api-key"
 OPENCODE_AUTH_PATH = Path(os.getenv("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "opencode" / "auth.json"
+PHOTO_CONFIG_PATH = CONFIG_DIR / "photo-analysis.local.json"
+PHOTO_MODELS_CACHE_PATH = CACHE_DIR / "opencode-go-models.json"
 LEGACY_YOUTUBE_TOKEN_PATH = LOCAL_CONFIG_DIR / "youtube-oauth.json"
 LEGACY_SPOTIFY_TOKEN_PATH = LOCAL_CONFIG_DIR / "spotify-oauth.json"
 OLDER_YOUTUBE_TOKEN_PATH = LEGACY_LOCAL_CONFIG_DIR / "youtube-oauth.json"
 OLDER_SPOTIFY_TOKEN_PATH = LEGACY_LOCAL_CONFIG_DIR / "spotify-oauth.json"
+SPOTIFY_API_ROOT = "https://api.spotify.com/v1"
+SPOTIFY_ACCOUNTS_ROOT = "https://accounts.spotify.com"
+SPOTIFY_SCOPES = "playlist-read-private playlist-modify-public playlist-modify-private user-read-private user-read-email streaming user-read-playback-state user-modify-playback-state"
+SPOTIFY_OAUTH_PENDING: Dict[str, Dict[str, Any]] = {}
+
+
+class SpotifyAPIError(ValueError):
+    """A structured Spotify response error that callers can handle by status."""
+
+    def __init__(self, status: int, method: str, path: str, body: str) -> None:
+        self.status = status
+        self.method = method
+        self.path = urlparse(path).path
+        self.body = body
+        super().__init__(f"Spotify API {method} {self.path} returned HTTP {status}: {body}")
 
 
 def utc_now() -> str:
@@ -90,6 +120,7 @@ def ensure_data_dir() -> None:
         DISCOGS_CACHE_DIR,
         SELLER_CACHE_DIR,
         REPORTS_DIR,
+        BACKUPS_DIR,
         QUICK_CRATES_DIR,
     ):
         directory.mkdir(parents=True, exist_ok=True)
@@ -173,7 +204,10 @@ def available_profiles(default_owner: str = "") -> List[Dict[str, str]]:
         if isinstance(record, dict) and str(record.get("owner") or "").strip():
             candidates.append(str(record["owner"]).strip())
     if WORKSPACE_DIR.exists():
-        candidates.extend(path.name for path in WORKSPACE_DIR.iterdir() if path.is_dir())
+        candidates.extend(
+            path.name for path in WORKSPACE_DIR.iterdir()
+            if path.is_dir() and path.name != "collectives" and not path.name.startswith(".")
+        )
 
     people: List[Dict[str, str]] = []
     seen = set()
@@ -689,10 +723,8 @@ def read_getsongbpm_key(api_key_file: Optional[str] = None) -> Optional[str]:
 def read_opencode_go_key(api_key_file: Optional[str] = None) -> Optional[str]:
     """Read an OpenCode Go credential without printing or committing it.
 
-    OpenCode stores credentials from `/connect`/`opencode auth login` in
-    ``~/.local/share/opencode/auth.json``.  The CLI also accepts an explicit
-    file and a conventional environment variable so it can be used outside
-    the OpenCode installation or in CI.
+    Prefer Cue Crate's own key, without modifying OpenCode's authentication.
+    The shared OpenCode credential remains a read-only compatibility fallback.
     """
     if api_key_file:
         try:
@@ -702,9 +734,22 @@ def read_opencode_go_key(api_key_file: Optional[str] = None) -> Optional[str]:
         if not key:
             raise SystemExit("The OpenCode Go API-key file is empty.")
         return key
+    if key := os.getenv("CUE_CRATE_OPENCODE_GO_API_KEY"):
+        return key.strip()
+    if OPENCODE_GO_CONFIG_PATH.exists():
+        key = OPENCODE_GO_CONFIG_PATH.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", OPENCODE_GO_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
     if key := os.getenv("OPENCODE_GO_API_KEY"):
         return key.strip()
-    for config_path in (OPENCODE_GO_CONFIG_PATH, LEGACY_OPENCODE_GO_CONFIG_PATH):
+    for config_path in (LEGACY_OPENCODE_GO_CONFIG_PATH,):
         if config_path.exists():
             key = config_path.read_text(encoding="utf-8").strip()
             if key:
@@ -723,20 +768,20 @@ def read_opencode_go_key(api_key_file: Optional[str] = None) -> Optional[str]:
 
 
 def getsongbpm_request(path: str, api_key: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-    query = dict(parameters)
-    query["api_key"] = api_key
+    query = {key: value for key, value in parameters.items() if key != "api_key"}
     request = Request(
         f"{GETSONGBPM_API_ROOT}{path}?{urlencode(query)}",
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json", "X-API-KEY": api_key},
     )
     try:
         with urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(f"GetSongBPM returned HTTP {exc.code}: {body}") from exc
+        # Provider/proxy error bodies can echo credentials; never forward them.
+        exc.close()
+        raise RuntimeError(f"GetSongBPM returned HTTP {exc.code}; check authorization and provider limits.") from None
     except URLError as exc:
-        raise RuntimeError(f"Could not reach GetSongBPM: {exc.reason}") from exc
+        raise RuntimeError("Could not reach GetSongBPM; check your connection and try again.") from None
 
 
 def load_catalog() -> Dict[str, Any]:
@@ -749,7 +794,7 @@ def load_catalog() -> Dict[str, Any]:
 def save_catalog(catalog: Dict[str, Any]) -> None:
     ensure_data_dir()
     catalog["updated_at"] = utc_now()
-    CATALOG_PATH.write_text(json.dumps(catalog, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_json(CATALOG_PATH, catalog)
 
 
 def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
@@ -759,9 +804,20 @@ def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically replace a JSON document so concurrent requests cannot splice writes."""
     ensure_data_dir()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    data = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def normalise_match_text(value: Optional[str]) -> str:
@@ -841,7 +897,7 @@ def build_review(owner: str) -> Dict[str, Any]:
     review = {"schema_version": 1, "generated_at": utc_now(), "owner": owner, "items": items}
     ensure_data_dir()
     review_path.parent.mkdir(parents=True, exist_ok=True)
-    review_path.write_text(json.dumps(review, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_json(review_path, review)
     return review
 
 
@@ -928,6 +984,102 @@ def command_prepare_additions(args: argparse.Namespace) -> None:
     print(f"Prepared {len(additions)} selected releases at {output}. Inspect or edit it before using add-to-discogs.")
 
 
+def reconcile_photo_review_identities(owner: str, apply_changes: bool = False) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Link photo evidence to canonical catalogue copies without asking the user again."""
+    review_path = person_workspace_path(owner, "review.json")
+    review = load_json(review_path, {"schema_version": 1, "owner": owner, "items": []})
+    records = [
+        record for record in load_catalog().get("records", [])
+        if record.get("owner", "").casefold() == owner.casefold()
+    ]
+    records_by_id = {str(record.get("id")): record for record in records}
+    records_by_release: Dict[str, List[Dict[str, Any]]] = {}
+    records_by_text: Dict[str, List[Dict[str, Any]]] = {}
+    for record in records:
+        release_id = str(record.get("discogs_release_id") or "")
+        if release_id:
+            records_by_release.setdefault(release_id, []).append(record)
+        records_by_text.setdefault(youtube_record_key(record), []).append(record)
+
+    methods: Counter[str] = Counter()
+    unresolved: List[Dict[str, Any]] = []
+    changed = 0
+    resolved_record_ids: List[str] = []
+    for item in review.get("items", []):
+        record: Optional[Dict[str, Any]] = None
+        method = ""
+        matched_id = str(item.get("matched_record_id") or "")
+        if matched_id in records_by_id:
+            previous_resolution = item.get("identity_resolution") if isinstance(item.get("identity_resolution"), dict) else {}
+            previous_method = str(previous_resolution.get("method") or "")
+            record, method = records_by_id[matched_id], previous_method or "existing_catalog_link"
+        selection = item.get("discogs_selection") if isinstance(item.get("discogs_selection"), dict) else {}
+        release_id = str(selection.get("release_id") or "")
+        if record is None and release_id:
+            release_matches = records_by_release.get(release_id, [])
+            if len(release_matches) == 1:
+                record, method = release_matches[0], "selected_discogs_release"
+            elif len(release_matches) > 1:
+                evidenced = [
+                    candidate for candidate in release_matches
+                    if any(
+                        source.get("kind") == "photo_review" and source.get("candidate_id") == item.get("id")
+                        for source in candidate.get("quick_access_sources", []) if isinstance(source, dict)
+                    )
+                ]
+                if len(evidenced) == 1:
+                    record, method = evidenced[0], "existing_photo_evidence"
+        identity = selection or item.get("manual_identification") or item.get("observed") or {}
+        if record is None and identity.get("artist") and identity.get("title"):
+            text_matches = records_by_text.get(youtube_record_key(identity), [])
+            # Multiple physical copies of one Discogs release still represent
+            # an ambiguous physical-copy link unless prior evidence chooses one.
+            if len(text_matches) == 1:
+                record, method = text_matches[0], "unique_artist_title"
+        if record is None:
+            unresolved.append({
+                "evidence_id": item.get("id", ""),
+                "artist": identity.get("artist", ""), "title": identity.get("title", ""),
+                "discogs_release_id": release_id,
+            })
+            continue
+        methods[method] += 1
+        resolved_record_ids.append(str(record["id"]))
+        before = (item.get("status"), item.get("matched_record_id"), item.get("identity_resolution"))
+        previous_resolution = item.get("identity_resolution") if isinstance(item.get("identity_resolution"), dict) else {}
+        same_resolution = (
+            item.get("status") == "confirmed"
+            and str(item.get("matched_record_id") or "") == str(record["id"])
+            and previous_resolution.get("state") == "catalog_linked"
+            and str(previous_resolution.get("record_id") or "") == str(record["id"])
+            and str(previous_resolution.get("discogs_release_id") or "") == str(record.get("discogs_release_id") or "")
+            and previous_resolution.get("method") == method
+        )
+        item["status"] = "confirmed"
+        item["matched_record_id"] = record["id"]
+        item["identity_resolution"] = {
+            "state": "catalog_linked", "method": method,
+            "record_id": record["id"],
+            "discogs_release_id": record.get("discogs_release_id") or "",
+            "resolved_at": previous_resolution.get("resolved_at") if same_resolution else utc_now(),
+        }
+        after = (item.get("status"), item.get("matched_record_id"), item.get("identity_resolution"))
+        if before != after:
+            changed += 1
+    report = {
+        "evidence_items": len(review.get("items", [])),
+        "resolved_evidence_items": len(resolved_record_ids),
+        "distinct_physical_records": len(set(resolved_record_ids)),
+        "changed_items": changed,
+        "methods": dict(methods),
+        "unresolved": unresolved,
+    }
+    if apply_changes:
+        review["identity_reconciled_at"] = utc_now()
+        write_json(review_path, review)
+    return review, report
+
+
 def quick_crate_entry(item: Dict[str, Any], owner: str, records_by_id: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Flatten a reviewed photo candidate into a portable DJ-list row."""
     record: Dict[str, Any] = {}
@@ -936,17 +1088,19 @@ def quick_crate_entry(item: Dict[str, Any], owner: str, records_by_id: Dict[str,
     if item.get("status") == "confirmed":
         record = records_by_id.get(item.get("matched_record_id"), {})
         identity_source = "confirmed_catalog"
-    elif item.get("manual_identification"):
-        record = item["manual_identification"]
-        identity_source = "manual_identification"
     elif selection:
         record = selection
         identity_source = "discogs_selected"
+    elif item.get("manual_identification"):
+        record = item["manual_identification"]
+        identity_source = "manual_identification"
     else:
         record = item.get("observed", {})
     observed = item.get("observed", {})
     return {
         "review_candidate_id": item["id"],
+        "evidence_ids": [item["id"]],
+        "record_id": record.get("id", "") or item.get("matched_record_id", ""),
         "owner": owner,
         "artist": record.get("artist", "") or "",
         "title": record.get("title", "") or "",
@@ -967,34 +1121,56 @@ def quick_crate_entry(item: Dict[str, Any], owner: str, records_by_id: Dict[str,
     }
 
 
+def quick_crate_entries(owner: str, review: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Export physical records once while retaining every photo evidence reference."""
+    records_by_id = {
+        record["id"]: record
+        for record in load_catalog().get("records", [])
+        if record.get("owner", "").casefold() == owner.casefold()
+    }
+    entries: List[Dict[str, Any]] = []
+    entry_by_identity: Dict[str, Dict[str, Any]] = {}
+    for item in review.get("items", []):
+        entry = quick_crate_entry(item, owner, records_by_id)
+        identity = f"record:{entry['record_id']}" if entry.get("record_id") else f"evidence:{item.get('id')}"
+        existing = entry_by_identity.get(identity)
+        if existing is None:
+            entry_by_identity[identity] = entry
+            entries.append(entry)
+            continue
+        existing["evidence_ids"] = list(dict.fromkeys([
+            *existing.get("evidence_ids", []), *entry.get("evidence_ids", []),
+        ]))
+    return entries
+
+
+def export_quick_crate(owner: str, output_dir: Optional[Path] = None) -> tuple[List[Dict[str, Any]], Path, Path]:
+    review = load_review(owner)
+    if review.get("owner", "").casefold() != owner.casefold():
+        raise SystemExit(f"review.json belongs to {review.get('owner', 'an unknown owner')}; use that owner or rebuild the review.")
+    entries = quick_crate_entries(owner, review)
+    destination = output_dir or QUICK_CRATES_DIR
+    destination.mkdir(parents=True, exist_ok=True)
+    json_path = destination / f"{person_context(owner)['id']}.json"
+    csv_path = destination / f"{person_context(owner)['id']}.csv"
+    write_json(json_path, {
+        "schema_version": 2, "generated_at": utc_now(), "owner": owner, "records": entries,
+    })
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(entries[0].keys()) if entries else ["owner", "artist", "title"])
+        writer.writeheader()
+        writer.writerows(entries)
+    refresh_aggregate_quick_crate()
+    return entries, json_path, csv_path
+
+
 def command_export_quick_crate(args: argparse.Namespace) -> None:
     """Export every reviewed photo position as a compact shareable DJ list."""
     review = load_review(args.owner)
     if review.get("owner", "").casefold() != args.owner.casefold():
         raise SystemExit(f"review.json belongs to {review.get('owner', 'an unknown owner')}; use that owner or rebuild the review.")
-    records_by_id = {
-        record["id"]: record
-        for record in load_catalog().get("records", [])
-        if record.get("owner", "").casefold() == args.owner.casefold()
-    }
-    entries = [quick_crate_entry(item, args.owner, records_by_id) for item in review.get("items", [])]
     output_dir = Path(args.output_dir).expanduser() if args.output_dir else QUICK_CRATES_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
-    json_path = output_dir / f"{person_context(args.owner)['id']}.json"
-    csv_path = output_dir / f"{person_context(args.owner)['id']}.csv"
-    json_path.write_text(json.dumps({
-        "schema_version": 1,
-        "generated_at": utc_now(),
-        "owner": args.owner,
-        "records": entries,
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(entries[0].keys()) if entries else ["owner", "artist", "title"])
-        writer.writeheader()
-        writer.writerows(entries)
-    # Keep a combined browser export for the shared crate view. Individual files
-    # remain authoritative so one person's export cannot overwrite another's.
-    refresh_aggregate_quick_crate()
+    entries, json_path, csv_path = export_quick_crate(args.owner, output_dir)
     sources = {}
     for entry in entries:
         sources[entry["identity_source"]] = sources.get(entry["identity_source"], 0) + 1
@@ -1140,6 +1316,15 @@ def absolute_discogs_url(uri: Optional[str], release_id: Optional[int] = None) -
     """Convert Discogs API-relative URIs into links that work in a browser."""
     value = str(uri or "").strip()
     if value.startswith("http://") or value.startswith("https://"):
+        parsed = urlparse(value)
+        # Collection API responses expose ``resource_url`` (for example
+        # https://api.discogs.com/releases/123).  That endpoint deliberately
+        # returns JSON, not a browseable Discogs page, so translate it before
+        # passing it to the UI.
+        if parsed.netloc.casefold().split(":", 1)[0] == "api.discogs.com":
+            match = re.search(r"/(?:release|releases)/(\d+)(?:/|$)", parsed.path, re.IGNORECASE)
+            if match:
+                return f"https://www.discogs.com/release/{match.group(1)}"
         return value
     if value:
         return f"https://www.discogs.com/{value.lstrip('/')}"
@@ -1198,7 +1383,7 @@ def selected_discogs_release(release_id: int, token: Optional[str]) -> Dict[str,
 def make_review_handler(owner: str, token: Optional[str] = None) -> type[http.server.SimpleHTTPRequestHandler]:
     review_path = person_workspace_path(owner, "review.json")
 
-    class ReviewHandler(http.server.SimpleHTTPRequestHandler):
+    class ReviewHandler(LocalRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             print(f"[review] {format % args}")
 
@@ -1355,7 +1540,7 @@ def make_review_handler(owner: str, token: Optional[str] = None) -> type[http.se
                             item["status"] = "identified_not_in_catalog"
                         item["discogs_selection"] = selected_discogs_release(release_id, token)
                         message = "Discogs release selected locally; it has not been added to Discogs."
-                    review_path.write_text(json.dumps(review, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    write_json(review_path, review)
                     write_json_response(self, {"ok": True, "item": item, "message": message})
                     return
                 if decision.get("status") not in {"confirmed", "identified_not_in_catalog", "needs_better_photo", "unmatched", "unreviewed"}:
@@ -1395,7 +1580,7 @@ def make_review_handler(owner: str, token: Optional[str] = None) -> type[http.se
                 if decision["status"] != "unreviewed":
                     item["discogs_selection"] = None
                 item["note"] = str(decision.get("note", ""))
-                review_path.write_text(json.dumps(review, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                write_json(review_path, review)
                 write_json_response(self, {"ok": True, "item": item})
             except (ValueError, KeyError, StopIteration, json.JSONDecodeError) as exc:
                 write_json_response(self, {"error": str(exc)}, 400)
@@ -1410,7 +1595,7 @@ def command_serve_review(args: argparse.Namespace) -> None:
     if not person_workspace_path(args.owner, "review.json").exists():
         build_review(args.owner)
     os.chdir(ROOT)
-    server = http.server.ThreadingHTTPServer((args.host, args.port), make_review_handler(args.owner, read_token(args.token_file, args.owner)))
+    server = LocalHTTPServer((args.host, args.port), make_review_handler(args.owner, read_token(args.token_file, args.owner)))
     print(f"Review at http://{args.host}:{args.port}/review.html")
     print("Press Ctrl+C to stop.")
     try:
@@ -1507,7 +1692,9 @@ def make_mobile_handler(owner: str, advertised_base: str, session_token: str) ->
         # Fragments are not sent in HTTP requests, browser history referrers, or server logs.
         return f"{advertised_base}/mobile.html#token={quote(session_token)}"
 
-    class MobileHandler(http.server.SimpleHTTPRequestHandler):
+    class MobileHandler(LocalRequestHandler):
+        advertised_host = urlparse(advertised_base).hostname or ""
+
         def log_message(self, format: str, *args: Any) -> None:
             print(f"[mobile] {format % args}")
 
@@ -1542,12 +1729,18 @@ def make_mobile_handler(owner: str, advertised_base: str, session_token: str) ->
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Referrer-Policy", "no-referrer")
+            # YouTube's embedded player requires a referrer/client identity.
+            # Cross-origin requests receive only this server's origin (never a
+            # path, query string, or the phone session token held in a URL
+            # fragment), which keeps the mobile companion capability private.
+            self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self) -> None:
+            if self.serve_desktop_session():
+                return
             path = urlparse(self.path).path
             if path == "/api/mobile/session":
                 if not self.authorised():
@@ -1664,7 +1857,7 @@ def command_serve_mobile(args: argparse.Namespace) -> None:
     address = args.advertise or mobile_advertised_address()
     base = f"http://{address}:{args.port}"
     token = secrets.token_urlsafe(24)
-    server = http.server.ThreadingHTTPServer((args.host, args.port), make_mobile_handler(args.owner, base, token))
+    server = LocalHTTPServer((args.host, args.port), make_mobile_handler(args.owner, base, token))
     print(f"Connect screen: http://127.0.0.1:{args.port}/connect.html#token={quote(token)}")
     print(f"Phone URL: {base}/mobile.html#token={quote(token)}")
     print("Press Ctrl+C to stop.")
@@ -1700,7 +1893,7 @@ def youtube_library_records(owner: str) -> List[Dict[str, Any]]:
         key = youtube_record_key({"artist": artist, "title": title})
         source_record = {
             "kind": source,
-            "record_id": record.get("id") or record.get("review_candidate_id", ""),
+            "record_id": record.get("record_id") or record.get("id") or record.get("review_candidate_id", ""),
             "discogs_release_id": record.get("discogs_release_id") or "",
         }
         current = merged.get(key)
@@ -1729,33 +1922,113 @@ def youtube_library_records(owner: str) -> List[Dict[str, Any]]:
     return sorted(merged.values(), key=lambda record: (normalise_match_text(record["artist"]), normalise_match_text(record["title"])))
 
 
+def youtube_provider_state_priority(item: Dict[str, Any]) -> tuple[int, int, int]:
+    status_priority = {"approved": 4, "auto_selected": 3, "unmatched": 2, "rejected": 1}
+    return (
+        1 if item.get("published_playlist_item_id") else 0,
+        status_priority.get(str(item.get("match_status") or "unmatched"), 0),
+        1 if item.get("selected_video_id") else 0,
+    )
+
+
 def build_youtube_music_review(owner: str) -> Dict[str, Any]:
+    """Rebuild listening rows from canonical records while retaining provider decisions."""
     review_path = person_youtube_review_path(owner)
     previous = load_json(review_path, {"owner": owner, "items": []})
     if previous.get("owner", "").casefold() not in {"", owner.casefold()}:
         raise SystemExit(f"youtube-music-review.json belongs to {previous.get('owner')}; use that owner or move it aside.")
-    existing = {item.get("id"): item for item in previous.get("items", [])}
+    previous_items = [item for item in previous.get("items", []) if isinstance(item, dict) and item.get("id")]
+    photo_review = load_json(person_workspace_path(owner, "review.json"), {"items": []})
+    photo_record_ids = {
+        str(item.get("id")): str(item.get("matched_record_id"))
+        for item in photo_review.get("items", []) if item.get("id") and item.get("matched_record_id")
+    }
+
+    def canonical_source_ids(item: Dict[str, Any]) -> set[str]:
+        result = set()
+        for source in item.get("sources", []):
+            if not isinstance(source, dict):
+                continue
+            source_id = str(source.get("record_id") or "")
+            if source_id:
+                result.add(photo_record_ids.get(source_id, source_id))
+        return result
+
+    def release_ids(item: Dict[str, Any]) -> set[str]:
+        values = {str(item.get("discogs_release_id") or "")}
+        values.update(
+            str(source.get("discogs_release_id") or "")
+            for source in item.get("sources", []) if isinstance(source, dict)
+        )
+        return {value for value in values if value}
+
+    used_previous_ids: set[str] = set()
+    aliases: Dict[str, str] = {
+        str(old): str(new)
+        for old, new in previous.get("identity_aliases", {}).items()
+        if old and new
+    }
     items = []
     for record in youtube_library_records(owner):
-        old = existing.get(record["id"], {})
+        identity_hint = record["id"]
+        record_source_ids = canonical_source_ids(record)
+        record_release_ids = release_ids(record)
+        matches = []
+        for old in previous_items:
+            old_id = str(old.get("id"))
+            if old_id in used_previous_ids:
+                continue
+            same_hint = old_id == identity_hint
+            same_source = bool(record_source_ids & canonical_source_ids(old))
+            same_release = bool(record_release_ids & release_ids(old))
+            if same_hint or same_source or same_release:
+                matches.append(old)
+        if not matches:
+            matches = [
+                old for old in previous_items
+                if str(old.get("id")) not in used_previous_ids and youtube_record_key(old) == identity_hint
+            ]
+        old = max(matches, key=youtube_provider_state_priority) if matches else {}
+        stable_id = str(old.get("id") or f"music-{uuid.uuid4().hex[:12]}")
+        for matched in matches:
+            matched_id = str(matched.get("id"))
+            used_previous_ids.add(matched_id)
+            aliases[matched_id] = stable_id
         query = youtube_query(record)
         items.append({
-            **record,
+            **old, **record,
+            "id": stable_id,
+            "identity": {
+                "state": "catalog_linked" if record_release_ids else "local_only",
+                "record_ids": sorted(record_source_ids),
+                "discogs_release_ids": sorted(record_release_ids),
+                "identity_hint": identity_hint,
+                "validated_at": utc_now(),
+            },
+            "superseded_ids": sorted(set([
+                *(str(value) for value in old.get("superseded_ids", []) if value),
+                *(str(matched.get("id")) for matched in matches if str(matched.get("id")) != stable_id),
+            ])),
             "query": query,
             "youtube_search_url": "https://www.youtube.com/results?" + urlencode({"search_query": query}),
             "youtube_music_search_url": "https://music.youtube.com/search?" + urlencode({"q": query}),
             "selected_video_url": old.get("selected_video_url", ""),
             "selected_video_id": old.get("selected_video_id", ""),
+            "selected_video_title": old.get("selected_video_title", ""),
+            "selected_video_channel": old.get("selected_video_channel", ""),
             "match_status": old.get("match_status", "unmatched"),
             "youtube_music_verified": bool(old.get("youtube_music_verified", False)),
             "youtube_music_checked_at": old.get("youtube_music_checked_at", ""),
             "note": old.get("note", ""),
             "published_playlist_item_id": old.get("published_playlist_item_id", ""),
+            "published_at": old.get("published_at", ""),
         })
     review = {
-        "schema_version": 1, "generated_at": utc_now(), "owner": owner,
+        "schema_version": 2, "generated_at": utc_now(), "owner": owner,
         "account_label": previous.get("account_label", ""),
         "playlist": previous.get("playlist", {}), "items": items,
+        "identity_aliases": aliases,
+        "identity_model": "provider choices annotate canonical catalogue-backed listening items",
         "notes": [
             "A YouTube Music check is a human approval: the public YouTube Data API does not expose a dependable in-YouTube-Music flag.",
             "Only items with an approved video ID and a checked YouTube Music verification box can be published.",
@@ -1782,6 +2055,606 @@ def extract_youtube_video_id(value: str) -> str:
     raise ValueError("Paste a standard YouTube or YouTube Music video URL (or its 11-character video ID).")
 
 
+def normalise_discogs_videos(videos: Any) -> List[Dict[str, Any]]:
+    """Turn Discogs' optional release videos into safe embeddable YouTube rows."""
+    if not isinstance(videos, list):
+        return []
+    normalised: List[Dict[str, Any]] = []
+    seen = set()
+    for video in videos:
+        if not isinstance(video, dict):
+            continue
+        url = str(video.get("uri") or video.get("url") or "").strip()
+        try:
+            video_id = extract_youtube_video_id(url)
+        except ValueError:
+            # Discogs can also link Vimeo or a non-embeddable source.  The
+            # embedded player intentionally exposes only verified YouTube IDs.
+            continue
+        if video_id in seen:
+            continue
+        seen.add(video_id)
+        duration = video.get("duration")
+        try:
+            duration_seconds = max(0, int(duration))
+        except (TypeError, ValueError):
+            duration_seconds = 0
+        normalised.append({
+            "video_id": video_id,
+            "title": str(video.get("title") or "Untitled video").strip(),
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "duration": duration_seconds,
+            "source": "Discogs",
+        })
+    return normalised
+
+
+def library_curated_videos(release_id: int, artist: str = "", title: str = "") -> List[Dict[str, Any]]:
+    """Return locally reviewed YouTube choices matching one library release.
+
+    These are not a replacement for Discogs' album video list: they surface a
+    DJ's deliberately chosen representative track first when one exists.
+    """
+    target_artist = normalise_match_text(artist)
+    target_title = normalise_match_text(title)
+    matches: List[Dict[str, Any]] = []
+    seen = set()
+    for profile in available_profiles():
+        review = load_json(person_youtube_review_path(profile["display_name"]), {"items": []})
+        for item in review.get("items", []) if isinstance(review, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            item_release_id = item.get("discogs_release_id")
+            same_release = str(item_release_id).isdigit() and int(item_release_id) == release_id
+            same_title = (
+                target_artist and target_title
+                and normalise_match_text(str(item.get("artist") or "")) == target_artist
+                and normalise_match_text(str(item.get("title") or "")) == target_title
+            )
+            if not (same_release or same_title):
+                continue
+            video_id = str(item.get("selected_video_id") or "").strip()
+            if not video_id or video_id in seen:
+                continue
+            try:
+                extract_youtube_video_id(video_id)
+            except ValueError:
+                continue
+            seen.add(video_id)
+            matches.append({
+                "video_id": video_id,
+                "title": str(item.get("selected_video_title") or item.get("title") or "Cue Crate selection").strip(),
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration": 0,
+                "source": "Cue Crate selection",
+            })
+    return matches
+
+
+def library_release_video_payload(release_id: int, token: Optional[str]) -> Dict[str, Any]:
+    """Load cached Discogs video references, refreshing a release only once."""
+    cache = load_json(RELEASE_FEATURES_PATH, {"schema_version": 1, "features": {}})
+    features = cache.setdefault("features", {})
+    cached = features.get(str(release_id), {})
+    if not isinstance(cached, dict):
+        cached = {}
+    if not cached.get("videos_known"):
+        release = discogs_request(f"/releases/{release_id}", token)
+        refreshed = release_feature(release)
+        # Preserve any fields introduced by other local enrichers while
+        # replacing the authoritative Discogs fields from the refresh.
+        cached.update(refreshed)
+        features[str(release_id)] = cached
+        cache["updated_at"] = utc_now()
+        write_json(RELEASE_FEATURES_PATH, cache)
+    videos = normalise_discogs_videos(cached.get("videos", []))
+    curated = library_curated_videos(release_id, str(cached.get("artist") or ""), str(cached.get("title") or ""))
+    # A confirmed Cue Crate choice is placed first, then the remaining Discogs
+    # videos follow in their original album-oriented order.
+    seen = {item["video_id"] for item in curated}
+    return {
+        "release_id": release_id,
+        "artist": cached.get("artist", ""),
+        "title": cached.get("title", ""),
+        "discogs_url": absolute_discogs_url(cached.get("uri"), release_id),
+        "videos": [*curated, *(item for item in videos if item["video_id"] not in seen)],
+    }
+
+
+def read_spotify_client_id() -> Optional[str]:
+    """Read the non-secret Spotify application ID from local configuration."""
+    value = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+    if not value and SPOTIFY_CLIENT_ID_CONFIG_PATH.exists():
+        value = SPOTIFY_CLIENT_ID_CONFIG_PATH.read_text(encoding="utf-8").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,128}", value):
+        raise ValueError("The configured Spotify Client ID is malformed.")
+    return value
+
+
+def spotify_token_payload(owner: str) -> Dict[str, Any]:
+    path = next((candidate for candidate in profile_provider_token_paths(owner, "spotify") if candidate.exists()), None)
+    payload = load_json(path, {}) if path else {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_spotify_token_payload(owner: str, payload: Dict[str, Any]) -> None:
+    path = profile_provider_token_path(owner, "spotify")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    write_json(path, payload)
+    path.chmod(0o600)
+
+
+def spotify_accounts_request(fields: Dict[str, str]) -> Dict[str, Any]:
+    request = Request(
+        f"{SPOTIFY_ACCOUNTS_ROOT}/api/token",
+        data=urlencode(fields).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ValueError(f"Spotify authorization returned HTTP {exc.code}: {body}") from exc
+    except URLError as exc:
+        raise ValueError(f"Could not reach Spotify authorization: {exc.reason}") from exc
+
+
+def spotify_access_token(owner: str, force_refresh: bool = False) -> str:
+    temporary = os.getenv("SPOTIFY_ACCESS_TOKEN", "").strip()
+    if temporary and not force_refresh:
+        return temporary
+    payload = spotify_token_payload(owner)
+    access_token = str(payload.get("access_token") or "").strip()
+    expires_at = float(payload.get("expires_at") or 0)
+    if access_token and not force_refresh and expires_at > time.time() + 60:
+        return access_token
+    refresh_token = str(payload.get("refresh_token") or "").strip()
+    client_id = read_spotify_client_id()
+    if not refresh_token or not client_id:
+        raise ValueError(f"Connect Spotify for {profile_context(owner)['display_name']} before using this feature.")
+    refreshed = spotify_accounts_request({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    })
+    if not refreshed.get("access_token"):
+        raise ValueError("Spotify did not return a refreshed access token.")
+    payload.update(refreshed)
+    payload["refresh_token"] = str(refreshed.get("refresh_token") or refresh_token)
+    payload["expires_at"] = time.time() + int(refreshed.get("expires_in") or 3600)
+    payload["refreshed_at"] = utc_now()
+    save_spotify_token_payload(owner, payload)
+    return str(payload["access_token"])
+
+
+def spotify_api_request(
+    path: str,
+    owner: str,
+    method: str = "GET",
+    payload: Optional[Dict[str, Any]] = None,
+    retry_auth: bool = True,
+) -> Dict[str, Any]:
+    if not path.startswith("/") or path.startswith("//"):
+        raise ValueError("Spotify API paths must be relative to the Web API root.")
+    token = spotify_access_token(owner)
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(f"{SPOTIFY_API_ROOT}{path}", data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=30) as response:
+            body = response.read()
+            return json.loads(body.decode("utf-8")) if body else {}
+    except HTTPError as exc:
+        if exc.code == 401 and retry_auth and not os.getenv("SPOTIFY_ACCESS_TOKEN", "").strip():
+            spotify_access_token(owner, force_refresh=True)
+            return spotify_api_request(path, owner, method, payload, retry_auth=False)
+        body = exc.read().decode("utf-8", errors="replace")[:500]
+        if exc.code == 429:
+            wait = exc.headers.get("Retry-After", "a short while")
+            raise ValueError(f"Spotify’s request quota was reached; retry after {wait} seconds.") from exc
+        raise SpotifyAPIError(exc.code, method, path, body) from exc
+    except URLError as exc:
+        raise ValueError(f"Could not reach Spotify: {exc.reason}") from exc
+
+
+def spotify_connection_status(owner: str) -> Dict[str, Any]:
+    client_configured = bool(read_spotify_client_id())
+    token = spotify_token_payload(owner)
+    connected = bool(os.getenv("SPOTIFY_ACCESS_TOKEN", "").strip() or token.get("refresh_token") or token.get("access_token"))
+    account = token.get("account", {}) if isinstance(token.get("account"), dict) else {}
+    label = str(account.get("display_name") or account.get("id") or "").strip()
+    granted_scopes = set(str(token.get("scope") or "").split())
+    playback_scopes = {"streaming", "user-read-playback-state", "user-modify-playback-state"}
+    return {
+        "configured": client_configured,
+        "connected": connected,
+        "account_label": label,
+        "account_product": str(account.get("product") or "").strip(),
+        "playback_available": connected and playback_scopes.issubset(granted_scopes),
+        "reauthorization_required": connected and not playback_scopes.issubset(granted_scopes),
+    }
+
+
+def spotify_web_playback_token(owner: str) -> Dict[str, Any]:
+    """Return a short-lived token only after the profile granted playback scopes."""
+    status = spotify_connection_status(owner)
+    if not status["connected"]:
+        raise ValueError("Connect Spotify before starting the full player.")
+    if status["reauthorization_required"]:
+        raise ValueError("Reconnect Spotify once to grant Cue Crate full-player access.")
+    if status["account_product"].casefold() != "premium":
+        raise ValueError("Spotify Web Playback requires a Premium account.")
+    access_token = spotify_access_token(owner)
+    token = spotify_token_payload(owner)
+    return {
+        "access_token": access_token,
+        "expires_at": float(token.get("expires_at") or 0),
+        "account_label": status["account_label"],
+    }
+
+
+def spotify_start_web_playback(owner: str, device_id: str, spotify_uri: str) -> None:
+    """Transfer a selected album or track to Cue Crate's browser player."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", device_id):
+        raise ValueError("Spotify did not return a valid browser device.")
+    uri_match = re.fullmatch(r"spotify:(album|track):([A-Za-z0-9]{10,64})", spotify_uri)
+    if not uri_match:
+        raise ValueError("Choose a valid Spotify album or track before playing.")
+    payload = {"context_uri": spotify_uri} if uri_match.group(1) == "album" else {"uris": [spotify_uri]}
+    spotify_api_request(
+        f"/me/player/play?{urlencode({'device_id': device_id})}",
+        owner,
+        method="PUT",
+        payload=payload,
+    )
+
+
+def spotify_authorization_url(owner: str, redirect_uri: str) -> str:
+    client_id = read_spotify_client_id()
+    if not client_id:
+        raise ValueError("Configure a Spotify Client ID before connecting an account.")
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+    state = secrets.token_urlsafe(32)
+    cutoff = time.time() - 900
+    for old_state in [key for key, value in SPOTIFY_OAUTH_PENDING.items() if float(value.get("created_at") or 0) < cutoff]:
+        SPOTIFY_OAUTH_PENDING.pop(old_state, None)
+    SPOTIFY_OAUTH_PENDING[state] = {
+        "owner": profile_context(owner)["display_name"],
+        "verifier": verifier,
+        "redirect_uri": redirect_uri,
+        "created_at": time.time(),
+    }
+    return f"{SPOTIFY_ACCOUNTS_ROOT}/authorize?{urlencode({
+        'client_id': client_id,
+        'response_type': 'code',
+        'redirect_uri': redirect_uri,
+        'scope': SPOTIFY_SCOPES,
+        'state': state,
+        'code_challenge_method': 'S256',
+        'code_challenge': challenge,
+        'show_dialog': 'true',
+    })}"
+
+
+def complete_spotify_authorization(parameters: Dict[str, List[str]]) -> str:
+    state = str(parameters.get("state", [""])[0]).strip()
+    pending = SPOTIFY_OAUTH_PENDING.pop(state, None)
+    if not state or not pending or time.time() - float(pending.get("created_at") or 0) > 900:
+        raise ValueError("This Spotify sign-in has expired. Start Connect Spotify again.")
+    if parameters.get("error"):
+        raise ValueError(f"Spotify sign-in was not completed: {parameters['error'][0]}")
+    code = str(parameters.get("code", [""])[0]).strip()
+    if not code:
+        raise ValueError("Spotify did not return an authorization code.")
+    owner = str(pending["owner"])
+    client_id = read_spotify_client_id()
+    tokens = spotify_accounts_request({
+        "client_id": str(client_id or ""),
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": str(pending["redirect_uri"]),
+        "code_verifier": str(pending["verifier"]),
+    })
+    if not tokens.get("access_token") or not tokens.get("refresh_token"):
+        raise ValueError("Spotify did not return a renewable authorization.")
+    tokens.update({
+        "expires_at": time.time() + int(tokens.get("expires_in") or 3600),
+        "authorized_at": utc_now(),
+        "scopes_requested": SPOTIFY_SCOPES.split(),
+    })
+    save_spotify_token_payload(owner, tokens)
+    account = spotify_api_request("/me", owner)
+    tokens["account"] = {
+        "id": str(account.get("id") or ""),
+        "display_name": str(account.get("display_name") or ""),
+        "product": str(account.get("product") or ""),
+    }
+    save_spotify_token_payload(owner, tokens)
+    return owner
+
+
+def normalise_spotify_url(value: str) -> Dict[str, str]:
+    """Validate a Spotify album or track reference and return safe embed URLs."""
+    source = str(value or "").strip()
+    if not source:
+        raise ValueError("Paste a Spotify album or track URL.")
+
+    kind = ""
+    spotify_id = ""
+    uri_match = re.fullmatch(r"spotify:(album|track):([A-Za-z0-9]{10,64})", source, re.IGNORECASE)
+    if uri_match:
+        kind, spotify_id = uri_match.group(1).casefold(), uri_match.group(2)
+    else:
+        parsed = urlparse(source)
+        hostname = (parsed.hostname or "").casefold()
+        if hostname not in {"open.spotify.com", "www.open.spotify.com"}:
+            raise ValueError("Use a link from open.spotify.com.")
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if parts and parts[0].casefold().startswith("intl-"):
+            parts.pop(0)
+        if parts and parts[0].casefold() == "embed":
+            parts.pop(0)
+        if len(parts) >= 2:
+            kind, spotify_id = parts[0].casefold(), parts[1]
+
+    if kind not in {"album", "track"}:
+        raise ValueError("Use a Spotify album or track link (playlists are not supported here yet).")
+    if not re.fullmatch(r"[A-Za-z0-9]{10,64}", spotify_id):
+        raise ValueError("The Spotify link does not contain a valid album or track ID.")
+    return {
+        "kind": kind,
+        "id": spotify_id,
+        "uri": f"spotify:{kind}:{spotify_id}",
+        "url": f"https://open.spotify.com/{kind}/{spotify_id}",
+        "embed_url": f"https://open.spotify.com/embed/{kind}/{spotify_id}?utm_source=generator&theme=0",
+    }
+
+
+def library_playback_source_payload(release_id: int) -> Dict[str, Any]:
+    registry = load_json(PLAYBACK_SOURCES_PATH, {"schema_version": 1, "releases": {}})
+    releases = registry.get("releases", {}) if isinstance(registry, dict) else {}
+    entry = releases.get(str(release_id), {}) if isinstance(releases, dict) else {}
+    spotify = entry.get("spotify") if isinstance(entry, dict) else None
+    if (
+        isinstance(spotify, dict)
+        and spotify.get("match_method") == "automatic"
+        and spotify.get("confidence") != "high"
+    ):
+        # An algorithmic leader is not a usable match unless it clears the
+        # confidence gate. Keep it among the visible candidates for review.
+        spotify = None
+    candidates = entry.get("spotify_candidates", []) if isinstance(entry, dict) else []
+    return {
+        "release_id": release_id,
+        "spotify": spotify if isinstance(spotify, dict) else None,
+        "spotify_candidates": candidates if isinstance(candidates, list) else [],
+    }
+
+
+def save_library_playback_source(release_id: int, spotify_url: str) -> Dict[str, Any]:
+    registry = load_json(PLAYBACK_SOURCES_PATH, {"schema_version": 1, "releases": {}})
+    if not isinstance(registry, dict):
+        registry = {"schema_version": 1, "releases": {}}
+    releases = registry.setdefault("releases", {})
+    if not isinstance(releases, dict):
+        releases = {}
+        registry["releases"] = releases
+
+    if str(spotify_url or "").strip():
+        spotify = normalise_spotify_url(spotify_url)
+        spotify.update({"confidence": "confirmed", "match_method": "manual_url", "score": 100})
+        releases[str(release_id)] = {
+            "release_id": release_id,
+            "spotify": spotify,
+            "spotify_candidates": [],
+            "updated_at": utc_now(),
+        }
+    else:
+        releases.pop(str(release_id), None)
+    registry["updated_at"] = utc_now()
+    write_json(PLAYBACK_SOURCES_PATH, registry)
+    return library_playback_source_payload(release_id)
+
+
+def clean_music_name(value: Any) -> str:
+    """Remove provider-specific artist suffixes while preserving the visible name."""
+    cleaned = re.sub(r"\s+\(\d+\)\s*$", "", str(value or "").replace("*", "").strip())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def spotify_artist_query_variants(value: Any) -> List[str]:
+    """Return useful Spotify spellings for aliases commonly seen on Discogs."""
+    artist = clean_music_name(value)
+    aliases = {
+        "thebbqband": ["The B.B. & Q. Band", "Brooklyn Bronx & Queens Band", "Brooklyn Bronx and Queens Band"],
+        "bbqband": ["B.B. & Q. Band", "Brooklyn Bronx & Queens Band", "Brooklyn Bronx and Queens Band"],
+    }
+    return list(dict.fromkeys([artist, *aliases.get(normalise_match_text(artist), [])]))
+
+
+def spotify_artist_text(item: Dict[str, Any]) -> str:
+    artists = item.get("artists", []) if isinstance(item, dict) else []
+    return ", ".join(str(artist.get("name") or "").strip() for artist in artists if isinstance(artist, dict) and artist.get("name"))
+
+
+def spotify_album_candidate(album: Dict[str, Any]) -> Dict[str, Any]:
+    spotify_id = str(album.get("id") or "").strip()
+    images = album.get("images", []) if isinstance(album.get("images"), list) else []
+    return {
+        "kind": "album",
+        "id": spotify_id,
+        "uri": str(album.get("uri") or f"spotify:album:{spotify_id}"),
+        "url": str(album.get("external_urls", {}).get("spotify") or f"https://open.spotify.com/album/{spotify_id}"),
+        "embed_url": f"https://open.spotify.com/embed/album/{spotify_id}?utm_source=generator&theme=0",
+        "name": str(album.get("name") or "").strip(),
+        "artist": spotify_artist_text(album),
+        "release_date": str(album.get("release_date") or ""),
+        "album_type": str(album.get("album_type") or "album"),
+        "total_tracks": int(album.get("total_tracks") or 0),
+        "cover_image": str(images[0].get("url") or "") if images and isinstance(images[0], dict) else "",
+    }
+
+
+def spotify_album_tracks(owner: str, album_id: str) -> List[Dict[str, Any]]:
+    tracks: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        response = spotify_api_request(f"/albums/{quote(album_id)}/tracks?limit=50&offset={offset}", owner)
+        page = [item for item in response.get("items", []) if isinstance(item, dict)]
+        tracks.extend(page)
+        if not response.get("next") or not page:
+            return tracks
+        offset += len(page)
+
+
+def music_similarity(left: Any, right: Any) -> float:
+    return difflib.SequenceMatcher(None, normalise_match_text(clean_music_name(left)), normalise_match_text(clean_music_name(right))).ratio()
+
+
+def music_artist_similarity(left: Any, right: Any) -> float:
+    """Recognise both written-out artist names and common initialisms such as B.B.&Q."""
+    direct = music_similarity(left, right)
+
+    def acronym(value: Any) -> str:
+        words = re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKD", clean_music_name(value)).encode("ascii", "ignore").decode("ascii").casefold())
+        meaningful = [word for word in words if word not in {"the", "and", "band", "group", "orchestra"}]
+        return "".join(word if len(word) == 1 else word[0] for word in meaningful)
+
+    left_acronym, right_acronym = acronym(left), acronym(right)
+    if len(left_acronym) >= 2 and left_acronym == right_acronym:
+        return max(direct, 0.94)
+    return direct
+
+
+def spotify_tracklist_overlap(target_tracks: List[Dict[str, Any]], candidate_tracks: List[Dict[str, Any]]) -> float:
+    targets = [str(track.get("title") or "") for track in target_tracks if isinstance(track, dict) and track.get("title")]
+    candidates = [str(track.get("name") or "") for track in candidate_tracks if isinstance(track, dict) and track.get("name")]
+    if not targets or not candidates:
+        return 0.0
+    matched = sum(1 for title in targets if max((music_similarity(title, candidate) for candidate in candidates), default=0) >= 0.84)
+    return matched / max(1, min(len(targets), len(candidates)))
+
+
+def score_spotify_album(record: Dict[str, Any], candidate: Dict[str, Any], tracks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    artist_score = music_artist_similarity(record.get("artist"), candidate.get("artist"))
+    title_score = music_similarity(record.get("title"), candidate.get("name"))
+    target_year = int(record.get("year") or 0) if str(record.get("year") or "").isdigit() else 0
+    candidate_year_text = str(candidate.get("release_date") or "")[:4]
+    candidate_year = int(candidate_year_text) if candidate_year_text.isdigit() else 0
+    if target_year and candidate_year:
+        year_gap = abs(target_year - candidate_year)
+        year_score = 1.0 if year_gap == 0 else 0.78 if year_gap == 1 else 0.48 if year_gap <= 3 else 0.12
+    else:
+        year_gap, year_score = None, 0.45
+    target_tracks = [track for track in record.get("tracklist", []) if isinstance(track, dict) and track.get("title")]
+    overlap = spotify_tracklist_overlap(target_tracks, tracks)
+    score = (artist_score * 34) + (title_score * 43) + (year_score * 8) + (overlap * 15 if target_tracks else 7)
+    suspicious = {"tribute", "karaoke", "re-recorded", "rerecorded", "workout", "lullaby"}
+    combined = f"{candidate.get('artist', '')} {candidate.get('name', '')}".casefold()
+    penalty_terms = sorted(term for term in suspicious if term in combined and term not in f"{record.get('artist', '')} {record.get('title', '')}".casefold())
+    score -= 20 * len(penalty_terms)
+    score = round(max(0.0, min(100.0, score)), 1)
+    if score >= 80 and artist_score >= 0.84 and title_score >= 0.82 and (not target_tracks or overlap >= 0.3 or title_score >= 0.97):
+        confidence = "high"
+    elif score >= 62 and artist_score >= 0.65 and title_score >= 0.62:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    evidence = [
+        f"artist {round(artist_score * 100)}%",
+        f"title {round(title_score * 100)}%",
+        f"tracklist {round(overlap * 100)}%" if target_tracks else "tracklist unavailable",
+        f"year {candidate_year or 'unknown'}" + (f" ({year_gap:+d})" if year_gap is not None and year_gap else ""),
+    ]
+    if penalty_terms:
+        evidence.append(f"penalty: {', '.join(penalty_terms)}")
+    return {**candidate, "score": score, "confidence": confidence, "evidence": evidence}
+
+
+def catalog_record_for_release(release_id: int) -> Dict[str, Any]:
+    records = [
+        record for record in load_catalog().get("records", [])
+        if str(record.get("discogs_release_id") or "") == str(release_id)
+    ]
+    if not records:
+        raise ValueError(f"Discogs release {release_id} is not in the local catalogue.")
+    return max(records, key=lambda record: len(record.get("tracklist", [])))
+
+
+def discover_spotify_album_match(release_id: int, owner: str, refresh: bool = False) -> Dict[str, Any]:
+    existing = library_playback_source_payload(release_id)
+    if existing.get("spotify") and not refresh:
+        return existing
+    if existing.get("spotify_candidates") and not refresh:
+        return existing
+    record = catalog_record_for_release(release_id)
+    artist = clean_music_name(record.get("artist"))
+    title = clean_music_name(record.get("title"))
+    year = str(record.get("year") or "").strip()
+    queries = [f"album:{title} artist:{artist}", f"{artist} {title}"]
+    if year.isdigit():
+        queries.insert(0, f"album:{title} artist:{artist} year:{year}")
+    albums: Dict[str, Dict[str, Any]] = {}
+    for query_text in queries:
+        response = spotify_api_request(f"/search?{urlencode({'q': query_text, 'type': 'album,track', 'limit': 10})}", owner)
+        for album in response.get("albums", {}).get("items", []):
+            if isinstance(album, dict) and album.get("id"):
+                albums.setdefault(str(album["id"]), album)
+        for track in response.get("tracks", {}).get("items", []):
+            album = track.get("album", {}) if isinstance(track, dict) else {}
+            if isinstance(album, dict) and album.get("id"):
+                albums.setdefault(str(album["id"]), album)
+        if len(albums) >= 8:
+            break
+    preliminary = sorted(
+        (spotify_album_candidate(album) for album in albums.values()),
+        key=lambda candidate: music_similarity(title, candidate["name"]) + music_similarity(artist, candidate["artist"]),
+        reverse=True,
+    )[:5]
+    scored = []
+    for candidate in preliminary:
+        tracks = spotify_album_tracks(owner, candidate["id"])
+        scored.append(score_spotify_album(record, candidate, tracks))
+    scored.sort(key=lambda candidate: candidate["score"], reverse=True)
+    candidates = scored[:3]
+    registry = load_json(PLAYBACK_SOURCES_PATH, {"schema_version": 1, "releases": {}})
+    releases = registry.setdefault("releases", {})
+    entry = releases.setdefault(str(release_id), {"release_id": release_id})
+    entry["spotify_candidates"] = candidates
+    if candidates and candidates[0].get("confidence") == "high":
+        entry["spotify"] = {**candidates[0], "match_method": "automatic", "matched_at": utc_now()}
+    else:
+        entry.pop("spotify", None)
+    entry["updated_at"] = utc_now()
+    registry["updated_at"] = utc_now()
+    write_json(PLAYBACK_SOURCES_PATH, registry)
+    return library_playback_source_payload(release_id)
+
+
+def select_spotify_album_candidate(release_id: int, spotify_id: str) -> Dict[str, Any]:
+    registry = load_json(PLAYBACK_SOURCES_PATH, {"schema_version": 1, "releases": {}})
+    releases = registry.setdefault("releases", {})
+    entry = releases.get(str(release_id), {})
+    candidates = entry.get("spotify_candidates", []) if isinstance(entry, dict) else []
+    selected = next((candidate for candidate in candidates if str(candidate.get("id") or "") == spotify_id), None)
+    if not selected:
+        raise ValueError("That Spotify candidate is no longer available; run the match again.")
+    entry["spotify"] = {**selected, "confidence": "confirmed", "score": 100, "match_method": "manual_candidate", "matched_at": utc_now()}
+    entry["updated_at"] = utc_now()
+    releases[str(release_id)] = entry
+    registry["updated_at"] = utc_now()
+    write_json(PLAYBACK_SOURCES_PATH, registry)
+    return library_playback_source_payload(release_id)
+
+
 def default_playlist(owner: str) -> Dict[str, Any]:
     """Return a non-secret draft playlist based on the existing YouTube review."""
     review = load_json(person_youtube_review_path(owner), {"items": [], "playlist": {}})
@@ -1789,11 +2662,29 @@ def default_playlist(owner: str) -> Dict[str, Any]:
     playlist_id = str(youtube.get("id") or "").strip()
     title = str(youtube.get("title") or f"{owner}'s Cue Crate").strip()
     destinations = ["youtube"] if playlist_id else []
-    track_ids = [
-        str(item.get("id")) for item in review.get("items", [])
-        if item.get("id") and item.get("match_status") == "approved"
-        and item.get("youtube_music_verified") and item.get("selected_video_id")
-    ]
+    review_items = review.get("items", []) if isinstance(review, dict) else []
+    if playlist_id:
+        # The provider receipt is the most faithful local description of an
+        # already-published playlist. It includes automatic choices that were
+        # deliberately published, not only later manual approvals.
+        candidates = [
+            item for item in review_items
+            if item.get("id") and item.get("published_playlist_item_id")
+            and item.get("selected_video_id") and item.get("match_status") != "rejected"
+        ]
+    else:
+        candidates = [
+            item for item in review_items
+            if item.get("id") and item.get("match_status") == "approved"
+            and item.get("youtube_music_verified") and item.get("selected_video_id")
+        ]
+    track_ids, seen_videos = [], set()
+    for item in candidates:
+        video_id = str(item.get("selected_video_id") or "")
+        if video_id in seen_videos:
+            continue
+        seen_videos.add(video_id)
+        track_ids.append(str(item["id"]))
     return {
         "id": f"{person_context(owner)['id']}-cue-crate",
         "owner": owner,
@@ -1851,6 +2742,7 @@ def playlist_track_options(review: Dict[str, Any], owner: str) -> List[Dict[str,
             "id": album_id, "kind": "album", "artist": item.get("artist", ""),
             "title": item.get("title", ""), "year": item.get("year", ""),
             "label": item.get("label", ""), "format": item.get("format", ""),
+            "discogs_release_id": source.get("discogs_release_id") or item.get("discogs_release_id"),
             "discogs_url": item.get("discogs_url", ""), "tracks": tracks,
             "match_status": item.get("match_status", "unmatched"),
             "selected_video_id": item.get("selected_video_id", ""),
@@ -1871,10 +2763,11 @@ def playlist_entries(playlist: Dict[str, Any], review: Dict[str, Any], owner: st
     if not isinstance(raw_entries, list):
         raw_ids = playlist.get("track_ids")
         if isinstance(raw_ids, list):
-            raw_entries = [{"kind": "album", "id": value} for value in raw_ids]
+            raw_entries = [{"kind": "album", "id": value, "mode": "representative"} for value in raw_ids]
         else:
             raw_entries = [
-                {"kind": "album", "id": option["id"]} for option in options if option["publish_ready"]
+                {"kind": "album", "id": option["id"], "mode": "representative"}
+                for option in options if option["publish_ready"]
             ]
     selected: List[Dict[str, Any]] = []
     seen = set()
@@ -1886,7 +2779,11 @@ def playlist_entries(playlist: Dict[str, Any], review: Dict[str, Any], owner: st
         kind = str(raw.get("kind") or "album").strip().casefold()
         entry_id = str(raw.get("id") or "").strip()
         if kind == "album" and entry_id in albums:
-            entry = {"kind": "album", "id": entry_id}
+            mode = str(raw.get("mode") or "representative").strip().casefold()
+            entry = {
+                "kind": "album", "id": entry_id,
+                "mode": mode if mode in {"representative", "full_album", "spotify_skip"} else "representative",
+            }
         elif kind == "track" and entry_id in tracks:
             entry = {"kind": "track", "id": entry_id, "album_id": tracks[entry_id]["album_id"]}
         else:
@@ -1910,6 +2807,224 @@ def load_playlists(owner: str) -> Dict[str, Any]:
     return {"schema_version": 1, "owner": owner, "playlists": [default_playlist(owner)]}
 
 
+def migrate_playlist_identities(
+    owner: str,
+    manager: Dict[str, Any],
+    old_review: Dict[str, Any],
+    new_review: Dict[str, Any],
+    restore_published_membership: bool = True,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Retarget identities; only explicit migrations recover YouTube membership."""
+    aliases = {
+        str(old): str(new)
+        for old, new in new_review.get("identity_aliases", {}).items()
+        if old and new
+    }
+    valid_album_ids = {
+        str(item.get("id")) for item in new_review.get("items", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    def alias_id(value: Any) -> str:
+        original = str(value or "")
+        if original in aliases:
+            return aliases[original]
+        # Track-entry IDs contain the album ID as a prefix.
+        for old, new in aliases.items():
+            prefix = f"{old}::track::"
+            if original.startswith(prefix):
+                return f"{new}::track::{original[len(prefix):]}"
+        return original
+
+    published_album_ids: List[str] = []
+    seen_videos, seen_albums = set(), set()
+    for item in old_review.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        video_id = str(item.get("selected_video_id") or "")
+        if (
+            not item.get("published_playlist_item_id") or not video_id
+            or item.get("match_status") == "rejected" or video_id in seen_videos
+        ):
+            continue
+        album_id = alias_id(item.get("id"))
+        if album_id not in valid_album_ids or album_id in seen_albums:
+            continue
+        seen_videos.add(video_id)
+        seen_albums.add(album_id)
+        published_album_ids.append(album_id)
+
+    remote_youtube_id = str(new_review.get("playlist", {}).get("id") or "")
+    before_counts, after_counts = {}, {}
+    playlists = manager.get("playlists", []) if isinstance(manager, dict) else []
+    for playlist in playlists:
+        if not isinstance(playlist, dict):
+            continue
+        playlist_id = str(playlist.get("id") or "")
+        existing_entries = playlist.get("entries")
+        if not isinstance(existing_entries, list):
+            existing_entries = [
+                {"kind": "album", "id": value, "mode": "representative"}
+                for value in playlist.get("track_ids", [])
+            ]
+        before_counts[playlist_id] = len(existing_entries)
+        migrated, seen = [], set()
+        modes: Dict[str, str] = {}
+        for entry in existing_entries:
+            if isinstance(entry, str):
+                entry = {"kind": "album", "id": entry}
+            if not isinstance(entry, dict):
+                continue
+            converted = dict(entry)
+            converted["id"] = alias_id(entry.get("id"))
+            if entry.get("album_id"):
+                converted["album_id"] = alias_id(entry.get("album_id"))
+            key = f"{converted.get('kind', 'album')}:{converted['id']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            migrated.append(converted)
+            if converted.get("kind", "album") == "album":
+                modes[converted["id"]] = str(converted.get("mode") or "representative")
+
+        playlist_youtube_id = str(playlist.get("youtube", {}).get("playlist_id") or "")
+        is_published_youtube_playlist = bool(
+            restore_published_membership and published_album_ids and remote_youtube_id
+            and playlist_youtube_id == remote_youtube_id
+        )
+        if is_published_youtube_playlist:
+            migrated = [
+                {"kind": "album", "id": album_id, "mode": modes.get(album_id, "representative")}
+                for album_id in published_album_ids
+            ]
+            playlist["membership_source"] = "published_youtube_receipts"
+        playlist["entries"] = migrated
+        playlist["track_ids"] = [
+            entry["id"] for entry in migrated if entry.get("kind", "album") == "album"
+        ]
+        # A routine collection refresh must not discard reviewed Spotify choices
+        # for an unchanged setlist. Only invalidate when IDs, order, or modes change.
+        # The remote Spotify playlist itself is deliberately left untouched.
+        if migrated != existing_entries:
+            playlist.pop("spotify_review", None)
+        playlist["identity_migrated_at"] = utc_now()
+        after_counts[playlist_id] = len(migrated)
+
+    manager["schema_version"] = 2
+    manager["owner"] = owner
+    manager["identity_model"] = "playlist entries reference canonical listening identities"
+    manager["identity_migrated_at"] = utc_now()
+    return manager, {
+        "playlist_entries_before": before_counts,
+        "playlist_entries_after": after_counts,
+        "published_youtube_membership": len(published_album_ids),
+        "identity_aliases": len(aliases),
+    }
+
+
+def backup_identity_migration(owner: str) -> tuple[Path, List[str]]:
+    """Back up every local metadata file that the identity migration can change."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = BACKUPS_DIR / f"identity-migration-{slugify_person(owner)}-{stamp}-{uuid.uuid4().hex[:6]}"
+    paths = [
+        CATALOG_PATH,
+        person_workspace_path(owner, "review.json"),
+        person_quick_crate_path(owner),
+        QUICK_CRATES_DIR / f"{person_context(owner)['id']}.csv",
+        AGGREGATE_QUICK_CRATE_PATH,
+        person_youtube_review_path(owner),
+        person_playlists_path(owner),
+        PLAYBACK_SOURCES_PATH,
+    ]
+    copied: List[str] = []
+    for source in paths:
+        if not source.exists():
+            continue
+        relative = source.relative_to(ROOT)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        copied.append(str(relative))
+    write_json(destination / "manifest.json", {
+        "schema_version": 1, "created_at": utc_now(), "owner": owner,
+        "purpose": "pre-canonical-identity migration rollback point",
+        "files": copied,
+    })
+    return destination, copied
+
+
+def command_migrate_library_identities(args: argparse.Namespace) -> None:
+    """Relink evidence and provider decisions to canonical catalogue identities."""
+    owner = person_context(args.owner)["display_name"]
+    _preview, photo_report = reconcile_photo_review_identities(owner, apply_changes=False)
+    old_review = load_json(person_youtube_review_path(owner), {"items": [], "playlist": {}})
+    old_manager = load_json(person_playlists_path(owner), {"playlists": [default_playlist(owner)]})
+    old_published = {
+        str(item.get("selected_video_id")) for item in old_review.get("items", [])
+        if isinstance(item, dict) and item.get("published_playlist_item_id")
+        and item.get("selected_video_id") and item.get("match_status") != "rejected"
+    }
+    plan = {
+        "mode": "apply" if args.apply else "dry_run",
+        "owner": owner,
+        "photo_evidence": photo_report,
+        "youtube_items_before": len(old_review.get("items", [])),
+        "published_youtube_videos_preserved": len(old_published),
+        "managed_playlists": len(old_manager.get("playlists", [])),
+        "provider_mutation": False,
+    }
+    if not args.apply:
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return
+
+    backup_dir, backed_up = backup_identity_migration(owner)
+    _review, applied_photo_report = reconcile_photo_review_identities(owner, apply_changes=True)
+    command_apply_review(argparse.Namespace(owner=owner))
+    quick_entries, _json_path, _csv_path = export_quick_crate(owner)
+    new_review = build_youtube_music_review(owner)
+    migrated_manager, playlist_report = migrate_playlist_identities(
+        owner, old_manager, old_review, new_review,
+    )
+    write_json(person_playlists_path(owner), migrated_manager)
+    result = {
+        **plan,
+        "backup": str(backup_dir.relative_to(ROOT)),
+        "backed_up_files": backed_up,
+        "photo_evidence": applied_photo_report,
+        "quick_crate_records": len(quick_entries),
+        "youtube_items_after": len(new_review.get("items", [])),
+        "playlist_migration": playlist_report,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def refresh_local_identity_views(owner: str) -> Dict[str, Any]:
+    """Refresh derived local views after a catalogue import; never call providers."""
+    report: Dict[str, Any] = {"photo_evidence_changed": 0, "quick_crate_records": None, "youtube_items": None}
+    review_path = person_workspace_path(owner, "review.json")
+    if review_path.exists():
+        _review, photo_report = reconcile_photo_review_identities(owner, apply_changes=True)
+        report["photo_evidence_changed"] = photo_report["changed_items"]
+        command_apply_review(argparse.Namespace(owner=owner))
+        entries, _json_path, _csv_path = export_quick_crate(owner)
+        report["quick_crate_records"] = len(entries)
+
+    youtube_path = person_youtube_review_path(owner)
+    if youtube_path.exists():
+        old_review = load_json(youtube_path, {"items": [], "playlist": {}})
+        new_review = build_youtube_music_review(owner)
+        report["youtube_items"] = len(new_review.get("items", []))
+        playlists_path = person_playlists_path(owner)
+        if playlists_path.exists():
+            manager = load_json(playlists_path, {"playlists": []})
+            manager, playlist_report = migrate_playlist_identities(
+                owner, manager, old_review, new_review, restore_published_membership=False,
+            )
+            write_json(playlists_path, manager)
+            report["playlist_migration"] = playlist_report
+    return report
+
+
 def playlist_manager_payload(owner: str) -> Dict[str, Any]:
     playlists = load_playlists(owner)
     review = load_json(person_youtube_review_path(owner), {"items": [], "playlist": {}})
@@ -1930,17 +3045,28 @@ def playlist_manager_payload(owner: str) -> Dict[str, Any]:
             and item.get("match_status") == "auto_selected" and item.get("selected_video_id")
         )
     youtube_token_paths = profile_provider_token_paths(owner, "youtube")
-    spotify_token_paths = profile_provider_token_paths(owner, "spotify")
     youtube_access = any(path.exists() for path in youtube_token_paths)
-    spotify_access = bool(os.getenv("SPOTIFY_ACCESS_TOKEN", "").strip()) or any(path.exists() for path in spotify_token_paths)
+    spotify_status = spotify_connection_status(owner)
     providers = {
         "youtube": {
             "label": "YouTube Music", "available": youtube_access,
             "detail": "OAuth is available for this profile." if youtube_access else "Connect a YouTube OAuth account for this profile before publishing.",
         },
         "spotify": {
-            "label": "Spotify", "available": spotify_access,
-            "detail": "An access token is available for this profile." if spotify_access else "Not connected yet. Store a Spotify access token for this profile to enable publishing.",
+            "label": "Spotify", "available": spotify_status["connected"],
+            "configured": spotify_status["configured"],
+            "account_label": spotify_status["account_label"],
+            "playback_available": spotify_status["playback_available"],
+            "reauthorization_required": spotify_status["reauthorization_required"],
+            "connect_url": f"/api/spotify/login?{urlencode({'owner': owner})}",
+            "detail": (
+                f"Connected as {spotify_status['account_label']}; reconnect once to enable full in-app playback."
+                if spotify_status["reauthorization_required"] and spotify_status["account_label"]
+                else f"Connected as {spotify_status['account_label']}." if spotify_status["connected"] and spotify_status["account_label"]
+                else "Spotify OAuth is connected for this profile." if spotify_status["connected"]
+                else "Client ID is ready. Connect this profile’s Spotify account."
+                if spotify_status["configured"] else "Configure a Spotify Client ID before connecting."
+            ),
         },
     }
     return {
@@ -2027,10 +3153,474 @@ def deploy_youtube_playlist(owner: str, playlist: Dict[str, Any]) -> Dict[str, A
     return {"playlist_id": playlist_id, "url": destination["url"], "added": added, "removed": removed, "available": len(desired), "track_entries_pending": track_entries}
 
 
+def spotify_track_candidate(track: Dict[str, Any]) -> Dict[str, Any]:
+    spotify_id = str(track.get("id") or "").strip()
+    album = track.get("album", {}) if isinstance(track.get("album"), dict) else {}
+    images = album.get("images", []) if isinstance(album.get("images"), list) else []
+    return {
+        "kind": "track",
+        "id": spotify_id,
+        "uri": str(track.get("uri") or f"spotify:track:{spotify_id}"),
+        "url": str(track.get("external_urls", {}).get("spotify") or f"https://open.spotify.com/track/{spotify_id}"),
+        "embed_url": f"https://open.spotify.com/embed/track/{spotify_id}?utm_source=generator&theme=0",
+        "name": str(track.get("name") or "").strip(),
+        "artist": spotify_artist_text(track),
+        "album": str(album.get("name") or "").strip(),
+        "cover_image": str(images[0].get("url") or "") if images and isinstance(images[0], dict) else "",
+    }
+
+
+def spotify_track_match_score(target: Dict[str, Any], candidate: Dict[str, Any], album_title: str = "") -> float:
+    title_score = music_similarity(target.get("title"), candidate.get("name"))
+    artist_score = music_artist_similarity(target.get("artist"), candidate.get("artist"))
+    candidate_album = candidate.get("album", {}) if isinstance(candidate.get("album"), dict) else candidate.get("album", "")
+    candidate_album_name = candidate_album.get("name") if isinstance(candidate_album, dict) else candidate_album
+    album_score = music_similarity(album_title, candidate_album_name) if album_title else 0.5
+    return round((title_score * 68) + (artist_score * 28) + (album_score * 4), 1)
+
+
+def score_spotify_track_candidate(target: Dict[str, Any], candidate: Dict[str, Any], album_title: str) -> Dict[str, Any]:
+    title_score = music_similarity(target.get("title"), candidate.get("name"))
+    artist_score = music_artist_similarity(target.get("artist"), candidate.get("artist"))
+    score = spotify_track_match_score(target, candidate, album_title)
+    confidence = "high" if score >= 80 and title_score >= 0.80 and artist_score >= 0.72 else "low"
+    return {
+        **candidate,
+        "score": score,
+        "confidence": confidence,
+        "evidence": [f"artist {round(artist_score * 100)}%", f"title {round(title_score * 100)}%"],
+    }
+
+
+def spotify_track_for_playlist_entry(
+    owner: str,
+    release_id: int,
+    track_entry: Dict[str, Any],
+    album_option: Dict[str, Any],
+    album_source: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    registry = load_json(PLAYBACK_SOURCES_PATH, {"schema_version": 1, "releases": {}})
+    releases = registry.setdefault("releases", {})
+    release_entry = releases.setdefault(str(release_id), {"release_id": release_id})
+    track_matches = release_entry.setdefault("spotify_tracks", {})
+    cached = track_matches.get(str(track_entry.get("id") or ""))
+    if isinstance(cached, dict) and cached.get("uri") and cached.get("confidence") in {"high", "confirmed"}:
+        return cached
+
+    raw_candidates: Dict[str, Dict[str, Any]] = {}
+    if album_source and album_source.get("kind") == "album" and album_source.get("id"):
+        for track in spotify_album_tracks(owner, str(album_source["id"])):
+            if track.get("id"):
+                raw_candidates[str(track["id"])] = track
+    album_title = str(album_option.get("title") or "")
+    ranked = sorted(
+        (score_spotify_track_candidate(track_entry, spotify_track_candidate(candidate), album_title) for candidate in raw_candidates.values()),
+        key=lambda candidate: candidate["score"],
+        reverse=True,
+    )
+    title = clean_music_name(track_entry.get("title"))
+    artist = clean_music_name(track_entry.get("artist"))
+    queries = []
+    for artist_variant in spotify_artist_query_variants(artist):
+        queries.extend([
+            f"track:{title} artist:{artist_variant}",
+            f"{artist_variant} {title}",
+            f"{title} {artist_variant}",
+        ])
+    for query_text in dict.fromkeys(query for query in queries if query.strip()):
+        response = spotify_api_request(f"/search?{urlencode({'q': query_text, 'type': 'track', 'limit': 10})}", owner)
+        for candidate in response.get("tracks", {}).get("items", []):
+            if isinstance(candidate, dict) and candidate.get("id"):
+                raw_candidates[str(candidate["id"])] = candidate
+    ranked = sorted(
+        (score_spotify_track_candidate(track_entry, spotify_track_candidate(candidate), album_title) for candidate in raw_candidates.values()),
+        key=lambda candidate: candidate["score"], reverse=True,
+    )
+    candidate_matches = release_entry.setdefault("spotify_track_candidates", {})
+    candidate_matches[str(track_entry.get("id") or "")] = ranked[:3]
+    release_entry["updated_at"] = utc_now()
+    registry["updated_at"] = utc_now()
+    write_json(PLAYBACK_SOURCES_PATH, registry)
+    if not ranked or ranked[0].get("confidence") != "high":
+        best = ranked[0] if ranked else {}
+        detail = f" Best candidate: {best.get('artist', '')} — {best.get('name', '')} ({best.get('score', 0)}%)." if best else ""
+        raise ValueError(f"No confident Spotify track match for {track_entry.get('artist', '')} — {track_entry.get('title', '')}.{detail}")
+    selected = {**ranked[0], "confidence": "high", "match_method": "automatic"}
+    track_matches[str(track_entry.get("id") or "")] = selected
+    release_entry["updated_at"] = utc_now()
+    registry["updated_at"] = utc_now()
+    write_json(PLAYBACK_SOURCES_PATH, registry)
+    return selected
+
+
+def search_spotify_track_candidates(
+    owner: str,
+    release_id: int,
+    track_id: str,
+    query_text: str,
+    target: Dict[str, Any],
+    album_title: str = "",
+) -> List[Dict[str, Any]]:
+    """Run a user-directed Spotify search and retain its candidates for confirmation."""
+    query_text = re.sub(r"\s+", " ", str(query_text or "")).strip()
+    if not query_text:
+        raise ValueError("Enter an artist, song title, or both before searching Spotify")
+    if len(query_text) > 200:
+        raise ValueError("Spotify search text must be 200 characters or fewer")
+    response = spotify_api_request(
+        f"/search?{urlencode({'q': query_text, 'type': 'track', 'limit': 10})}", owner,
+    )
+    candidates: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in response.get("tracks", {}).get("items", []):
+        if not isinstance(raw, dict) or not raw.get("id") or raw.get("id") in seen:
+            continue
+        seen.add(raw["id"])
+        candidate = spotify_track_candidate(raw)
+        candidate.update({
+            "score": spotify_track_match_score(target, raw, album_title),
+            "confidence": "manual_search",
+            "evidence": [f"Spotify result for “{query_text}”"],
+        })
+        candidates.append(candidate)
+    registry = load_json(PLAYBACK_SOURCES_PATH, {"schema_version": 1, "releases": {}})
+    releases = registry.setdefault("releases", {})
+    release_entry = releases.setdefault(str(release_id), {"release_id": release_id})
+    release_entry.setdefault("spotify_track_candidates", {})[track_id] = candidates[:10]
+    release_entry.setdefault("spotify_manual_queries", {})[track_id] = query_text
+    release_entry["updated_at"] = utc_now()
+    registry["updated_at"] = utc_now()
+    write_json(PLAYBACK_SOURCES_PATH, registry)
+    return candidates[:10]
+
+
+def select_spotify_track_candidate(release_id: int, track_id: str, spotify_id: str) -> Dict[str, Any]:
+    """Confirm one prepared Spotify track candidate for a playlist entry."""
+    registry = load_json(PLAYBACK_SOURCES_PATH, {"schema_version": 1, "releases": {}})
+    releases = registry.setdefault("releases", {})
+    release_entry = releases.get(str(release_id), {})
+    candidates_by_track = release_entry.get("spotify_track_candidates", {}) if isinstance(release_entry, dict) else {}
+    candidates = candidates_by_track.get(track_id, []) if isinstance(candidates_by_track, dict) else []
+    selected = next((item for item in candidates if str(item.get("id") or "") == spotify_id), None)
+    if not selected:
+        raise ValueError("That Spotify track candidate is no longer available; prepare the playlist again.")
+    track_matches = release_entry.setdefault("spotify_tracks", {})
+    track_matches[track_id] = {
+        **selected, "confidence": "confirmed", "score": 100,
+        "match_method": "manual_candidate", "matched_at": utc_now(),
+    }
+    release_entry["updated_at"] = utc_now()
+    registry["updated_at"] = utc_now()
+    write_json(PLAYBACK_SOURCES_PATH, registry)
+    return track_matches[track_id]
+
+
+def enrich_youtube_selection_titles(owner: str, review: Dict[str, Any]) -> None:
+    """Backfill curated video titles without requiring a YouTube OAuth session."""
+    missing = [
+        item for item in review.get("items", []) if isinstance(item, dict)
+        and item.get("selected_video_id") and not item.get("selected_video_title")
+    ]
+    if not missing:
+        return
+    by_id = {str(item["selected_video_id"]): item for item in missing}
+
+    def read_oembed(video_id: str) -> tuple[str, Dict[str, Any]]:
+        endpoint = "https://www.youtube.com/oembed?" + urlencode({
+            "url": f"https://www.youtube.com/watch?v={video_id}", "format": "json",
+        })
+        request = Request(endpoint, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        try:
+            with urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                return video_id, payload if isinstance(payload, dict) else {}
+        except (HTTPError, URLError, json.JSONDecodeError):
+            return video_id, {}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for video_id, payload in executor.map(read_oembed, by_id):
+            target = by_id[video_id]
+            if payload.get("title"):
+                target["selected_video_title"] = str(payload["title"]).strip()
+                target["selected_video_channel"] = str(payload.get("author_name") or "").strip()
+    write_json(person_youtube_review_path(owner), review)
+
+
+def youtube_title_track_score(video_title: str, track: Dict[str, Any], album_artist: str) -> float:
+    track_title = str(track.get("title") or "").strip()
+    track_artist = str(track.get("artist") or album_artist or "").strip()
+    video_key = normalise_match_text(video_title)
+    title_key = normalise_match_text(track_title)
+    if title_key and title_key in video_key:
+        return 1.0
+    return max(
+        music_similarity(track_title, video_title),
+        music_similarity(f"{track_artist} {track_title}", video_title),
+    )
+
+
+def clean_youtube_track_title(video_title: str, album_artist: str) -> str:
+    """Reduce common upload-title decoration to a useful song search phrase."""
+    text = re.sub(r"[_|]+", " ", str(video_title or "")).strip()
+    text = re.sub(r"\[(?:[^\]]*(?:official|audio|video|hq|hd|remaster|lyrics|vinyl|boogie)[^\]]*)\]", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\((?:19|20)\d{2}\)|\((?:official|audio|video|hq|hd|remaster(?:ed)?|lyrics)[^)]*\)", " ", text, flags=re.IGNORECASE)
+    parts = [part.strip() for part in re.split(r"\s+[—–-]\s+", text) if part.strip()]
+    if len(parts) > 1:
+        artist_key = normalise_match_text(clean_music_name(album_artist))
+        artist_index = max(range(len(parts)), key=lambda index: music_similarity(parts[index], artist_key))
+        if music_similarity(parts[artist_index], artist_key) >= 0.62:
+            alternatives = [part for index, part in enumerate(parts) if index != artist_index and not re.fullmatch(r"[A-Z]?\d+", part, re.IGNORECASE)]
+            if alternatives:
+                text = alternatives[-1]
+    artist_pattern = re.escape(clean_music_name(album_artist))
+    if artist_pattern:
+        text = re.sub(rf"^\s*{artist_pattern}\s*[:\-–—]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:official\s+)?(?:music\s+)?video\b|\bofficial audio\b|\blyrics?\b|\b(?:4k|hq|hd)\b|\bumg\b", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip(" -–—·")
+
+
+def representative_discogs_track(review_item: Dict[str, Any], album_option: Dict[str, Any]) -> Dict[str, Any]:
+    video_title = str(review_item.get("selected_video_title") or "").strip()
+    if not video_title:
+        raise ValueError("the curated YouTube selection has no readable title")
+    ranked = sorted(
+        (
+            ({**track, "youtube_title_score": round(youtube_title_track_score(video_title, track, str(album_option.get("artist") or "")) * 100, 1)})
+            for track in album_option.get("tracks", []) if isinstance(track, dict)
+        ),
+        key=lambda track: track["youtube_title_score"],
+        reverse=True,
+    )
+    if ranked and ranked[0]["youtube_title_score"] >= 68:
+        return ranked[0]
+    cleaned_title = clean_youtube_track_title(video_title, str(album_option.get("artist") or ""))
+    if not cleaned_title:
+        raise ValueError(f"could not derive a song title from the curated YouTube choice “{video_title}”")
+    return {
+        "id": f"youtube::{review_item.get('selected_video_id') or normalise_match_text(video_title)}",
+        "position": "Curated",
+        "artist": album_option.get("artist", ""),
+        "title": cleaned_title,
+        "youtube_title_score": 100,
+        "title_source": "youtube_selection",
+    }
+
+
+def prepare_spotify_playlist(owner: str, playlist: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve a playlist without mutating Spotify; unresolved entries become a review queue."""
+    review = load_json(person_youtube_review_path(owner), {"items": []})
+    enrich_youtube_selection_titles(owner, review)
+    entries = playlist_entries(playlist, review, owner)
+    options = playlist_track_options(review, owner)
+    albums = {option["id"]: option for option in options}
+    tracks = {track["id"]: track for option in options for track in option["tracks"]}
+    review_items = {str(item.get("id")): item for item in review.get("items", []) if isinstance(item, dict)}
+    representative_video_ids = [
+        str(review_items.get(str(entry.get("id")), {}).get("selected_video_id") or "")
+        for entry in entries if entry.get("kind") == "album" and entry.get("mode", "representative") == "representative"
+    ]
+    repeated_video_ids = {video_id for video_id, count in Counter(representative_video_ids).items() if video_id and count > 1}
+    omitted_entry_ids = {
+        str(value) for value in playlist.get("spotify_omissions", []) if str(value).strip()
+    }
+    prepared: List[Dict[str, Any]] = []
+    for entry in entries:
+        album_option = albums.get(entry.get("album_id") or entry.get("id"), {})
+        label = tracks.get(entry.get("id"), album_option)
+        result: Dict[str, Any] = {
+            "entry_id": entry.get("id"), "kind": entry.get("kind"),
+            "mode": entry.get("mode", "representative"),
+            "artist": label.get("artist", ""), "title": label.get("title", ""),
+            "album_artist": album_option.get("artist", ""), "album_title": album_option.get("title", ""),
+            "discogs_release_id": album_option.get("discogs_release_id"),
+            "status": "needs_review", "reason": "",
+        }
+        source_item = review_items.get(str(entry.get("id")), {})
+        selected_video_id = str(source_item.get("selected_video_id") or "")
+        if str(entry.get("id")) in omitted_entry_ids:
+            result.update({"status": "skipped", "reason": "Explicitly marked as having no suitable Spotify match."})
+            prepared.append(result)
+            continue
+        if entry.get("mode") == "spotify_skip":
+            result.update({"status": "skipped", "reason": "Explicitly skipped for the Spotify destination."})
+            prepared.append(result)
+            continue
+        if entry.get("kind") == "album" and selected_video_id in repeated_video_ids:
+            result["reason"] = "This same curated YouTube upload is selected for more than one record. Choose the intended song in the YouTube track review."
+            result["review_url"] = f"/youtube-review.html?{urlencode({'owner': owner})}"
+            prepared.append(result)
+            continue
+        release_value = album_option.get("discogs_release_id")
+        if not str(release_value or "").isdigit():
+            result["reason"] = "No exact Discogs release ID is available."
+            result["review_url"] = "/review.html"
+            prepared.append(result)
+            continue
+        release_id = int(release_value)
+        result["review_url"] = f"/viewer.html?release_id={release_id}"
+        target_track: Optional[Dict[str, Any]] = None
+        try:
+            if entry.get("kind") == "album" and entry.get("mode", "representative") == "full_album":
+                match = discover_spotify_album_match(release_id, owner)
+                album_source = match.get("spotify")
+                if not album_source:
+                    candidates = match.get("spotify_candidates", [])
+                    best = candidates[0] if candidates else {}
+                    raise ValueError(
+                        f"The album match needs confirmation"
+                        + (f"; best candidate scored {best.get('score', 0)}%." if best else ".")
+                    )
+                result.update({"status": "ready", "spotify_album": album_source})
+            else:
+                target_track = tracks.get(entry.get("id"))
+                youtube_selection = ""
+                if entry.get("kind") == "album":
+                    youtube_selection = str(source_item.get("selected_video_title") or "")
+                    target_track = representative_discogs_track(source_item, album_option)
+                    result["representative_track"] = {
+                        "position": target_track.get("position", ""),
+                        "artist": target_track.get("artist", ""),
+                        "title": target_track.get("title", ""),
+                        "youtube_selection": youtube_selection,
+                        "youtube_title_score": target_track.get("youtube_title_score"),
+                    }
+                if not target_track:
+                    raise ValueError("The selected Discogs track is no longer available.")
+                album_match = discover_spotify_album_match(release_id, owner)
+                spotify_track = spotify_track_for_playlist_entry(
+                    owner, release_id, target_track, album_option, album_match.get("spotify")
+                )
+                if spotify_track.get("confidence") not in {"high", "confirmed"}:
+                    raise ValueError(f"The best Spotify track candidate scored only {spotify_track.get('score', 0)}%.")
+                result.update({"status": "ready", "spotify_track": spotify_track})
+        except (RuntimeError, ValueError) as exc:
+            result["reason"] = str(exc)
+            if target_track and target_track.get("id"):
+                registry = load_json(PLAYBACK_SOURCES_PATH, {"releases": {}})
+                release_entry = registry.get("releases", {}).get(str(release_id), {})
+                candidate_map = release_entry.get("spotify_track_candidates", {}) if isinstance(release_entry, dict) else {}
+                candidates = candidate_map.get(str(target_track["id"]), []) if isinstance(candidate_map, dict) else []
+                result["spotify_target_track_id"] = str(target_track["id"])
+                result["spotify_track_candidates"] = candidates[:3] if isinstance(candidates, list) else []
+        prepared.append(result)
+    ready = sum(1 for item in prepared if item["status"] == "ready")
+    skipped = sum(1 for item in prepared if item["status"] == "skipped")
+    review_state = {
+        "prepared_at": utc_now(), "total": len(prepared), "ready": ready,
+        "skipped": skipped, "needs_review": len(prepared) - ready - skipped, "items": prepared,
+    }
+    playlist["spotify_review"] = review_state
+    return review_state
+
+
+def refresh_spotify_review_counts(review_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Recount a prepared review after one local manual decision."""
+    items = review_state.get("items", []) if isinstance(review_state, dict) else []
+    review_state["total"] = len(items)
+    review_state["ready"] = sum(item.get("status") == "ready" for item in items)
+    review_state["skipped"] = sum(item.get("status") == "skipped" for item in items)
+    review_state["needs_review"] = sum(item.get("status") == "needs_review" for item in items)
+    review_state["updated_at"] = utc_now()
+    return review_state
+
+
+def spotify_playlist_items(owner: str, playlist: Dict[str, Any]) -> tuple[List[str], List[str]]:
+    review_state = prepare_spotify_playlist(owner, playlist)
+    unresolved = [item for item in review_state["items"] if item["status"] == "needs_review"]
+    if unresolved:
+        raise ValueError(
+            f"{len(unresolved)} Spotify entr{'y needs' if len(unresolved) == 1 else 'ies need'} review before publishing."
+        )
+    uris: List[str] = []
+    for item in review_state["items"]:
+        if item.get("spotify_track"):
+            uris.append(str(item["spotify_track"].get("uri") or ""))
+        elif item.get("spotify_album"):
+            source = item["spotify_album"]
+            if source.get("kind") == "track":
+                uris.append(str(source.get("uri") or f"spotify:track:{source.get('id', '')}"))
+            else:
+                uris.extend(
+                    str(track.get("uri") or "")
+                    for track in spotify_album_tracks(owner, str(source.get("id") or ""))
+                )
+    return list(dict.fromkeys(uri for uri in uris if uri)), []
+
+
+def deploy_spotify_playlist(owner: str, playlist: Dict[str, Any]) -> Dict[str, Any]:
+    uris, skipped = spotify_playlist_items(owner, playlist)
+    if not uris:
+        detail = f" First issue: {skipped[0]}" if skipped else ""
+        raise ValueError(f"This playlist has no Spotify-matched tracks ready to publish.{detail}")
+    destination = playlist.setdefault("spotify", {})
+    playlist_id = str(destination.get("playlist_id") or "").strip()
+    title = str(playlist.get("name") or APP_NAME).strip()
+    description = str(playlist.get("description") or "").strip()
+    public = str(playlist.get("visibility") or "unlisted").strip().casefold() == "public"
+    replaced_playlist_id = ""
+    if playlist_id:
+        try:
+            spotify_api_request(
+                f"/playlists/{quote(playlist_id)}",
+                owner,
+                method="PUT",
+                payload={"name": title, "description": description, "public": public},
+            )
+        except SpotifyAPIError as exc:
+            if exc.status != 404:
+                raise
+            # A playlist can disappear after deletion or an account switch.
+            # Preserve that receipt for diagnostics, then create a replacement
+            # under the currently authenticated profile.
+            replaced_playlist_id = playlist_id
+            destination.update({
+                "unavailable_playlist_id": playlist_id,
+                "unavailable_at": utc_now(),
+            })
+            playlist_id = ""
+    if not playlist_id:
+        created = spotify_api_request(
+            "/me/playlists",
+            owner,
+            method="POST",
+            payload={"name": title, "description": description, "public": public},
+        )
+        playlist_id = str(created.get("id") or "")
+        if not playlist_id:
+            raise ValueError("Spotify created no playlist ID.")
+        # Spotify has occasionally defaulted a new playlist to public despite
+        # the create payload. Apply the requested details once more to make
+        # the local visibility choice authoritative.
+        spotify_api_request(
+            f"/playlists/{quote(playlist_id)}",
+            owner,
+            method="PUT",
+            payload={"name": title, "description": description, "public": public},
+        )
+    first, rest = uris[:100], uris[100:]
+    spotify_api_request(f"/playlists/{quote(playlist_id)}/items", owner, method="PUT", payload={"uris": first})
+    for offset in range(0, len(rest), 100):
+        spotify_api_request(
+            f"/playlists/{quote(playlist_id)}/items",
+            owner,
+            method="POST",
+            payload={"uris": rest[offset:offset + 100]},
+        )
+    url = f"https://open.spotify.com/playlist/{playlist_id}"
+    destination.update({
+        "status": "published", "playlist_id": playlist_id, "url": url,
+        "updated_at": utc_now(), "published_item_count": len(uris),
+    })
+    return {
+        "playlist_id": playlist_id, "url": url, "published": len(uris), "skipped": skipped,
+        "replaced_unavailable_playlist_id": replaced_playlist_id,
+    }
+
+
 def make_youtube_review_handler(owner: str) -> type[http.server.SimpleHTTPRequestHandler]:
     review_path = person_youtube_review_path(owner)
 
-    class YouTubeReviewHandler(http.server.SimpleHTTPRequestHandler):
+    class YouTubeReviewHandler(LocalRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             print(f"[youtube-review] {format % args}")
 
@@ -2070,13 +3660,145 @@ def make_youtube_review_handler(owner: str) -> type[http.server.SimpleHTTPReques
                     action = str(update.get("action") or "save").strip().casefold()
                     playlist_id = str(update.get("id") or "").strip()
                     playlist = next((item for item in playlists if item.get("id") == playlist_id), None)
+                    if action == "prepare_spotify":
+                        if playlist is None:
+                            raise ValueError("Playlist not found")
+                        result = prepare_spotify_playlist(request_owner, playlist)
+                        manager.update({"schema_version": 1, "owner": request_owner, "playlists": playlists, "updated_at": utc_now()})
+                        write_json(person_playlists_path(request_owner), manager)
+                        write_json_response(self, {"ok": True, "spotify_preparation": result, **playlist_manager_payload(request_owner)})
+                        return
+                    if action == "search_spotify_track":
+                        if playlist is None:
+                            raise ValueError("Playlist not found")
+                        review_state = playlist.get("spotify_review")
+                        if not isinstance(review_state, dict):
+                            raise ValueError("Prepare Spotify matches before searching for a replacement track")
+                        entry_id = str(update.get("entry_id") or "").strip()
+                        issue = next(
+                            item for item in review_state.get("items", [])
+                            if isinstance(item, dict) and str(item.get("entry_id") or "") == entry_id
+                        )
+                        release_value = issue.get("discogs_release_id")
+                        track_id = str(issue.get("spotify_target_track_id") or "").strip()
+                        if not str(release_value or "").isdigit() or not track_id:
+                            raise ValueError("This entry has no track target available for a Spotify search")
+                        representative = issue.get("representative_track") if isinstance(issue.get("representative_track"), dict) else {}
+                        target = {
+                            "artist": representative.get("artist") or issue.get("artist") or issue.get("album_artist"),
+                            "title": representative.get("title") or issue.get("title") or issue.get("album_title"),
+                        }
+                        candidates = search_spotify_track_candidates(
+                            request_owner, int(release_value), track_id,
+                            str(update.get("query") or ""), target,
+                            str(issue.get("album_title") or ""),
+                        )
+                        issue["spotify_track_candidates"] = candidates
+                        issue["spotify_manual_query"] = str(update.get("query") or "").strip()
+                        issue["reason"] = (
+                            f"Choose one of {len(candidates)} Spotify search results."
+                            if candidates else "Spotify returned no tracks for that search. Try another artist or title."
+                        )
+                        manager.update({"schema_version": 1, "owner": request_owner, "playlists": playlists, "updated_at": utc_now()})
+                        write_json(person_playlists_path(request_owner), manager)
+                        write_json_response(self, {"ok": True, **playlist_manager_payload(request_owner)})
+                        return
+                    if action == "set_spotify_omission":
+                        if playlist is None:
+                            raise ValueError("Playlist not found")
+                        entry_id = str(update.get("entry_id") or "").strip()
+                        valid_entry_ids = {
+                            str(entry.get("id") or "") for entry in playlist.get("entries", [])
+                            if isinstance(entry, dict)
+                        }
+                        if not entry_id or entry_id not in valid_entry_ids:
+                            raise ValueError("That playlist entry is no longer available")
+                        omissions = {
+                            str(value) for value in playlist.get("spotify_omissions", []) if str(value).strip()
+                        }
+                        omitted = bool(update.get("omitted", True))
+                        if omitted:
+                            omissions.add(entry_id)
+                        else:
+                            omissions.discard(entry_id)
+                        playlist["spotify_omissions"] = sorted(omissions)
+                        review_state = playlist.get("spotify_review")
+                        if isinstance(review_state, dict):
+                            item = next((
+                                value for value in review_state.get("items", [])
+                                if isinstance(value, dict) and str(value.get("entry_id") or "") == entry_id
+                            ), None)
+                            if item is not None and omitted:
+                                item["spotify_state_before_omission"] = {
+                                    key: item.get(key)
+                                    for key in ("status", "reason", "spotify_track", "spotify_album")
+                                    if key in item
+                                }
+                                item.update({
+                                    "status": "skipped",
+                                    "reason": "Explicitly marked as having no suitable Spotify match.",
+                                })
+                            elif item is not None:
+                                previous = item.pop("spotify_state_before_omission", {})
+                                item["status"] = previous.get("status", "needs_review")
+                                item["reason"] = previous.get("reason", "Run the Spotify match again or choose a track manually.")
+                                for field in ("spotify_track", "spotify_album"):
+                                    if field in previous:
+                                        item[field] = previous[field]
+                                    elif item.get("status") != "ready":
+                                        item.pop(field, None)
+                            if playlist.get("spotify_review"):
+                                refresh_spotify_review_counts(review_state)
+                        manager.update({"schema_version": 1, "owner": request_owner, "playlists": playlists, "updated_at": utc_now()})
+                        write_json(person_playlists_path(request_owner), manager)
+                        write_json_response(self, {"ok": True, **playlist_manager_payload(request_owner)})
+                        return
+                    if action == "select_spotify_track":
+                        if playlist is None:
+                            raise ValueError("Playlist not found")
+                        release_value = update.get("release_id")
+                        if not str(release_value or "").isdigit():
+                            raise ValueError("A numeric Discogs release ID is required")
+                        selected_track = select_spotify_track_candidate(
+                            int(release_value),
+                            str(update.get("track_id") or "").strip(),
+                            str(update.get("spotify_id") or "").strip(),
+                        )
+                        review_state = playlist.get("spotify_review")
+                        if not isinstance(review_state, dict):
+                            raise ValueError("Prepare Spotify matches before confirming a track")
+                        entry_id = str(update.get("entry_id") or "").strip()
+                        issue = next((
+                            item for item in review_state.get("items", [])
+                            if isinstance(item, dict)
+                            and str(item.get("spotify_target_track_id") or "") == str(update.get("track_id") or "").strip()
+                            and (not entry_id or str(item.get("entry_id") or "") == entry_id)
+                        ), None)
+                        if issue is None:
+                            raise ValueError("That prepared Spotify issue is no longer available")
+                        issue.update({"status": "ready", "reason": "", "spotify_track": selected_track})
+                        result = refresh_spotify_review_counts(review_state)
+                        manager.update({"schema_version": 1, "owner": request_owner, "playlists": playlists, "updated_at": utc_now()})
+                        write_json(person_playlists_path(request_owner), manager)
+                        write_json_response(self, {"ok": True, "spotify_preparation": result, **playlist_manager_payload(request_owner)})
+                        return
                     if action == "deploy":
                         if playlist is None:
                             raise ValueError("Playlist not found")
                         provider = str(update.get("provider") or "").strip().casefold()
-                        if provider != "youtube":
-                            raise ValueError("Spotify deployment is not connected yet; save the destination and add Spotify OAuth first")
-                        result = deploy_youtube_playlist(request_owner, playlist)
+                        destinations = [
+                            str(value).strip().casefold() for value in playlist.get("destinations", [])
+                            if str(value).strip().casefold() in {"youtube", "spotify"}
+                        ]
+                        if provider in {"youtube", "spotify"} and provider not in destinations:
+                            destinations.append(provider)
+                        playlist["destinations"] = destinations
+                        if provider == "youtube":
+                            result = deploy_youtube_playlist(request_owner, playlist)
+                        elif provider == "spotify":
+                            result = deploy_spotify_playlist(request_owner, playlist)
+                        else:
+                            raise ValueError("Playlist provider must be YouTube or Spotify")
                         manager.update({"schema_version": 1, "owner": request_owner, "playlists": playlists, "updated_at": utc_now()})
                         person_playlists_path(request_owner).parent.mkdir(parents=True, exist_ok=True)
                         write_json(person_playlists_path(request_owner), manager)
@@ -2116,7 +3838,11 @@ def make_youtube_review_handler(owner: str) -> type[http.server.SimpleHTTPReques
                                 kind = str(raw_entry.get("kind") or "album").strip().casefold()
                                 entry_id = str(raw_entry.get("id") or "").strip()
                                 if kind == "album" and entry_id in allowed_albums:
-                                    entry = {"kind": "album", "id": entry_id}
+                                    mode = str(raw_entry.get("mode") or "representative").strip().casefold()
+                                    entry = {
+                                        "kind": "album", "id": entry_id,
+                                        "mode": mode if mode in {"representative", "full_album", "spotify_skip"} else "representative",
+                                    }
                                 elif kind == "track" and entry_id in allowed_tracks:
                                     entry = {"kind": "track", "id": entry_id, "album_id": allowed_tracks[entry_id]["album_id"]}
                                 else:
@@ -2137,6 +3863,10 @@ def make_youtube_review_handler(owner: str) -> type[http.server.SimpleHTTPReques
                                 if track_id in allowed and track_id not in seen:
                                     track_ids.append(track_id)
                                     seen.add(track_id)
+                        previous_entries = (
+                            [dict(entry) for entry in playlist.get("entries", []) if isinstance(entry, dict)]
+                            if isinstance(playlist, dict) else None
+                        )
                         if playlist is None:
                             playlist_id = f"{person_context(request_owner)['id']}-{slugify_person(name)}-{uuid.uuid4().hex[:6]}"
                             playlist = {
@@ -2150,8 +3880,16 @@ def make_youtube_review_handler(owner: str) -> type[http.server.SimpleHTTPReques
                         if entries is not None:
                             playlist["entries"] = entries
                             playlist["track_ids"] = track_ids
+                            if previous_entries != entries:
+                                playlist.pop("spotify_review", None)
+                            selected_ids = {entry["id"] for entry in entries}
+                            playlist["spotify_omissions"] = [
+                                value for value in playlist.get("spotify_omissions", [])
+                                if value in selected_ids
+                            ]
                         elif track_ids is not None:
                             playlist["track_ids"] = track_ids
+                            playlist.pop("spotify_review", None)
                     manager.update({"schema_version": 1, "owner": request_owner, "playlists": playlists, "updated_at": utc_now()})
                     person_playlists_path(request_owner).parent.mkdir(parents=True, exist_ok=True)
                     write_json(person_playlists_path(request_owner), manager)
@@ -2206,7 +3944,7 @@ def command_serve_youtube_music_review(args: argparse.Namespace) -> None:
     if not person_youtube_review_path(args.owner).exists():
         build_youtube_music_review(args.owner)
     os.chdir(ROOT)
-    server = http.server.ThreadingHTTPServer((args.host, args.port), make_youtube_review_handler(args.owner))
+    server = LocalHTTPServer((args.host, args.port), make_youtube_review_handler(args.owner))
     print(f"YouTube Music review at http://{args.host}:{args.port}/youtube-review.html")
     print("Press Ctrl+C to stop.")
     try:
@@ -2278,14 +4016,67 @@ def make_cue_crate_handler(
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Referrer-Policy", "no-referrer")
+            # Preserve the origin for embeddable media providers such as
+            # YouTube, without exposing paths, query strings, or fragments.
+            self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self) -> None:
+            if self.serve_desktop_session():
+                return
             parsed = urlparse(self.path)
             path = parsed.path
+            if path == "/api/spotify/login":
+                if not self.local_api_only():
+                    return
+                requested_owner = parse_qs(parsed.query, keep_blank_values=True).get("owner", [owner])[0]
+                redirect_uri = f"http://127.0.0.1:{self.server.server_port}/api/spotify/callback"
+                try:
+                    location = spotify_authorization_url(requested_owner, redirect_uri)
+                except (OSError, ValueError) as exc:
+                    write_json_response(self, {"error": str(exc)}, 400)
+                    return
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            if path == "/api/spotify/callback":
+                if not self.local_api_only():
+                    return
+                try:
+                    connected_owner = complete_spotify_authorization(parse_qs(parsed.query, keep_blank_values=True))
+                except (OSError, ValueError) as exc:
+                    body = f"Spotify connection failed: {exc}\n\nReturn to Cue Crate and try Connect Spotify again.".encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(302)
+                self.send_header("Location", f"/playlists.html?{urlencode({'owner': connected_owner, 'spotify': 'connected'})}")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            if path == "/api/spotify/status":
+                if not self.local_api_only():
+                    return
+                requested_owner = parse_qs(parsed.query, keep_blank_values=True).get("owner", [owner])[0]
+                write_json_response(self, spotify_connection_status(requested_owner))
+                return
+            if path == "/api/spotify/access-token":
+                if not self.local_api_only():
+                    return
+                requested_owner = parse_qs(parsed.query, keep_blank_values=True).get("owner", [owner])[0]
+                try:
+                    write_json_response(self, spotify_web_playback_token(requested_owner))
+                except (OSError, ValueError) as exc:
+                    write_json_response(self, {"error": str(exc)}, 409)
+                return
             if path.startswith("/api/mobile/"):
                 MobileHandler.do_GET(self)
                 return
@@ -2305,6 +4096,29 @@ def make_cue_crate_handler(
                 if self.local_api_only():
                     write_json_response(self, load_json(RELEASE_FEATURES_PATH, {"features": {}}))
                 return
+            if path == "/api/library/release-videos":
+                if not self.local_api_only():
+                    return
+                release_value = parse_qs(parsed.query, keep_blank_values=True).get("release_id", [""])[0]
+                if not str(release_value).isdigit():
+                    write_json_response(self, {"error": "A numeric Discogs release ID is required."}, 400)
+                    return
+                try:
+                    write_json_response(self, library_release_video_payload(int(release_value), discogs_token))
+                except SystemExit as exc:
+                    write_json_response(self, {"error": str(exc)}, 502)
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    write_json_response(self, {"error": f"Could not load album videos: {exc}"}, 502)
+                return
+            if path == "/api/library/playback-sources":
+                if not self.local_api_only():
+                    return
+                release_value = parse_qs(parsed.query, keep_blank_values=True).get("release_id", [""])[0]
+                if not str(release_value).isdigit():
+                    write_json_response(self, {"error": "A numeric Discogs release ID is required."}, 400)
+                    return
+                write_json_response(self, library_playback_source_payload(int(release_value)))
+                return
             if path == "/api/library/quick-crate":
                 if self.local_api_only():
                     write_json_response(self, load_json(AGGREGATE_QUICK_CRATE_PATH, {"records": []}))
@@ -2323,6 +4137,22 @@ def make_cue_crate_handler(
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            if path == "/api/spotify/play":
+                if not self.local_api_only():
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    update = json.loads(self.rfile.read(length).decode("utf-8"))
+                    requested_owner = str(update.get("owner") or owner).strip()
+                    spotify_start_web_playback(
+                        requested_owner,
+                        str(update.get("device_id") or "").strip(),
+                        str(update.get("uri") or "").strip(),
+                    )
+                    write_json_response(self, {"ok": True})
+                except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+                    write_json_response(self, {"error": str(exc)}, 400)
+                return
             if path == "/api/mobile/upload":
                 MobileHandler.do_POST(self)
                 return
@@ -2333,6 +4163,45 @@ def make_cue_crate_handler(
             if path in YOUTUBE_POST_ROUTES:
                 if self.local_api_only():
                     YouTubeHandler.do_POST(self)
+                return
+            if path == "/api/library/playback-sources":
+                if not self.local_api_only():
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    update = json.loads(self.rfile.read(length).decode("utf-8"))
+                    release_value = update.get("release_id")
+                    if not str(release_value).isdigit():
+                        raise ValueError("A numeric Discogs release ID is required.")
+                    payload = save_library_playback_source(
+                        int(release_value), str(update.get("spotify_url") or "")
+                    )
+                    write_json_response(self, payload)
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    write_json_response(self, {"error": str(exc)}, 400)
+                return
+            if path == "/api/library/spotify-match":
+                if not self.local_api_only():
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    update = json.loads(self.rfile.read(length).decode("utf-8"))
+                    release_value = update.get("release_id")
+                    if not str(release_value).isdigit():
+                        raise ValueError("A numeric Discogs release ID is required.")
+                    action = str(update.get("action") or "discover").strip().casefold()
+                    if action == "select":
+                        payload = select_spotify_album_candidate(int(release_value), str(update.get("spotify_id") or ""))
+                    elif action == "discover":
+                        requested_owner = str(update.get("owner") or owner).strip()
+                        payload = discover_spotify_album_match(
+                            int(release_value), requested_owner, bool(update.get("refresh"))
+                        )
+                    else:
+                        raise ValueError("Spotify match action must be discover or select.")
+                    write_json_response(self, payload)
+                except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+                    write_json_response(self, {"error": str(exc)}, 400)
                 return
             self.send_error(404)
 
@@ -2361,7 +4230,7 @@ def command_serve(args: argparse.Namespace) -> None:
     base = f"http://{address}:{args.port}"
     token = secrets.token_urlsafe(24)
     os.chdir(ROOT)
-    server = http.server.ThreadingHTTPServer(
+    server = LocalHTTPServer(
         (host, args.port),
         make_cue_crate_handler(args.owner, base, token, read_token(args.token_file, args.owner)),
     )
@@ -2802,7 +4671,7 @@ def normalise_api_item(item: Dict[str, Any], owner: str) -> Dict[str, Any]:
         "year": info.get("year") or "",
         "format": text(info.get("formats", [])),
         "cover_image": info.get("cover_image", ""),
-        "discogs_url": info.get("resource_url", ""),
+        "discogs_url": absolute_discogs_url(info.get("resource_url"), release_id),
         "collection_folder_id": item.get("folder_id"),
         "collection_notes": item.get("notes", ""),
         "source": "discogs_api",
@@ -2823,7 +4692,7 @@ def merge_records(catalog: Dict[str, Any], incoming: List[Dict[str, Any]]) -> tu
         key = record_key(record)
         if key in existing:
             old = catalog["records"][existing[key]]
-            for local_field in ("tracklist", "dj_notes", "quick_access", "quick_access_sources", "crate_locations", "collection_notes"):
+            for local_field in ("tracklist", "dj_notes", "quick_access", "quick_access_sources", "crate_locations", "collective_ids", "collection_notes"):
                 if local_field in old:
                     record[local_field] = old[local_field]
             catalog["records"][existing[key]] = record
@@ -2972,7 +4841,7 @@ def command_import_csv(args: argparse.Namespace) -> None:
                 "year": row.get("Released", ""),
                 "format": row.get("Format", ""),
                 "cover_image": "",
-                "discogs_url": f"{API_ROOT}/releases/{release_id}",
+                "discogs_url": f"https://www.discogs.com/release/{release_id}",
                 "collection_folder": row.get("CollectionFolder", ""),
                 "collection_notes": row.get("Collection Notes", ""),
                 "source": "discogs_csv",
@@ -3030,6 +4899,12 @@ def release_feature(release: Dict[str, Any]) -> Dict[str, Any]:
         "formats": [format_name for format_name in formats if format_name],
         "community": release.get("community", {}),
         "uri": release.get("uri", ""),
+        # Discogs release records may include a small, editorially-curated
+        # list of linked YouTube videos.  Retaining it alongside the existing
+        # release metadata lets the Library provide album previews without
+        # requiring a separate media database or any new user credential.
+        "videos": normalise_discogs_videos(release.get("videos", [])),
+        "videos_known": True,
         "fetched_at": utc_now(),
     }
 
@@ -3525,6 +5400,7 @@ def command_fetch_collection(args: argparse.Namespace) -> None:
     if args.reconcile:
         reconciliation = reconcile_discogs_snapshot(catalog, incoming, args.owner)
     save_catalog(catalog)
+    local_views = refresh_local_identity_views(args.owner)
     message = f"Fetched {len(incoming)} records for {args.owner}: {added} added, {updated} updated."
     if args.reconcile:
         message += (
@@ -3532,6 +5408,15 @@ def command_fetch_collection(args: argparse.Namespace) -> None:
             f"preserved {reconciliation['preserved']} local-only rows; "
             f"updated {reconciliation['review_updates']} saved review references."
         )
+    refreshed = [
+        f"{local_views['quick_crate_records']} quick-crate records"
+        if local_views.get("quick_crate_records") is not None else "",
+        f"{local_views['youtube_items']} listening records"
+        if local_views.get("youtube_items") is not None else "",
+    ]
+    refreshed = [value for value in refreshed if value]
+    if refreshed:
+        message += f" Refreshed {' and '.join(refreshed)} against canonical catalogue identities."
     print(message)
 
 
@@ -3718,10 +5603,10 @@ Only transcribe text that is visible. Do not guess titles, artists, editions, BP
 
 
 INTAKE_PROMPT = """You are identifying one physical vinyl record from several photographs of the same item.
-Reconcile all views before answering. The primary evidence view is usually the back cover; optional label, barcode close-up, and front views provide context.
+Reconcile all views before answering. A centre-label photo alone is valid evidence: many records have only generic sleeves and no artwork or barcode. The primary view may be an A-side label, a B-side label, or a detailed back cover. An optional other-side label, barcode close-up, or front view may provide additional facts. A-side and B-side photos show ONE physical record, not two records; retain differing side-specific titles in visible_text rather than inventing an album title.
 Return ONLY a JSON object with this shape:
 {"artist":"string or null","title":"string or null","label":"string or null","catalog_number":"string or null","barcode":"string or null","country":"string or null","year":"string or null","format":"string or null","visible_text":"string","confidence":"high|medium|low","confidence_reason":"string"}
-Only report text and identifiers visible in the supplied photographs. Do not guess a pressing or Discogs release ID. Treat these as different fields: catalog_number is the label/sleeve catalogue or matrix code (for example TSR 330701), while barcode is the complete numeric string printed directly under the barcode bars (preserve readable spaces, for example 4 006759 984444). Never copy a nearby number above the bars into barcode. Prefer a dedicated BARCODE view when present; if it is not legible, return null rather than inventing digits."""
+Only report text and identifiers visible in the supplied photographs. Do not guess a pressing or Discogs release ID. A catalogue number is helpful, not required: return null if it cannot be read. Treat these as different fields: catalog_number is the label/sleeve catalogue code (for example TSR 330701), while barcode is the complete numeric string printed directly under the barcode bars (preserve readable spaces, for example 4 006759 984444). Other matrix/runout markings belong in visible_text, not in catalog_number unless explicitly identified as the catalogue code. Never copy a nearby number above the bars into barcode. Prefer a dedicated BARCODE view when present; if it is not legible, return null rather than inventing digits. Confidence in a readable artist/title is not proof of an exact pressing."""
 
 
 def image_data_url(path: Path, max_dimension: int = 2048) -> str:
@@ -3764,120 +5649,94 @@ def image_data_url(path: Path, max_dimension: int = 2048) -> str:
     return f"data:image/jpeg;base64,{encoded}"
 
 
-def minimax_photo_completion(api_key: str, photo: Path, max_tokens: int) -> str:
-    """Send one image to the Anthropic-compatible MiniMax M3 Go endpoint."""
-    # MiniMax's Anthropic-compatible gateway closes very large base64 image
-    # bodies; 1024px is about 3.2 MB for the current six-record grids.
-    data_url = image_data_url(photo, max_dimension=1024)
-    header, encoded = data_url.split(",", 1)
-    media_type = header.removeprefix("data:").removesuffix(";base64")
-    payload = {
-        "model": "minimax-m3",
-        "max_tokens": max_tokens,
-        "system": PHOTO_PROMPT,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}},
-                {"type": "text", "text": "Identify the six physical records in this photograph. JSON only."},
-            ],
-        }],
-    }
-    request = Request(
-        "https://opencode.ai/zen/go/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
+def configured_photo_settings(args: argparse.Namespace) -> Dict[str, Any]:
     try:
-        with urlopen(request, timeout=90) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:500]
-        raise SystemExit(f"MiniMax returned HTTP {exc.code}: {detail}")
-    except URLError as exc:
-        raise SystemExit(f"MiniMax could not be reached: {exc.reason}")
-    except OSError as exc:
-        if exc.errno == 32:
-            raise SystemExit("MiniMax's OpenCode Go gateway closed the image request. Text requests work, but image input is not currently usable through this route.")
-        raise
-    return "\n".join(block.get("text", "") for block in body.get("content", []) if block.get("type") == "text")
+        config = load_photo_config(Path(args.photo_config).expanduser() if args.photo_config else PHOTO_CONFIG_PATH)
+        catalog = load_model_catalog(PHOTO_MODELS_CACHE_PATH)
+        return photo_model_settings(catalog, config, args.provider, args.model, args.max_tokens)
+    except PhotoProviderError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def photo_completion(api_key: str, settings: Dict[str, Any], prompt: str, content: list) -> str:
+    try:
+        return complete_photo(api_key, settings, prompt, content)
+    except PhotoProviderError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def command_photo_models(args: argparse.Namespace) -> None:
+    try:
+        catalog = load_model_catalog(PHOTO_MODELS_CACHE_PATH, refresh=args.refresh)
+        config = load_photo_config(Path(args.photo_config).expanduser() if args.photo_config else PHOTO_CONFIG_PATH)
+    except PhotoProviderError as exc:
+        raise SystemExit(str(exc)) from exc
+    defaults = {**DEFAULT_MODELS, **config.get("models", {})}
+    rows = []
+    for model in catalog["data"]:
+        if not isinstance(model, dict) or not supports_images(model):
+            continue
+        supported = model.get("api", {}).get("chat-completions", {}).get("base_url", "").rstrip("/") == GO_CHAT_BASE_URL
+        rows.append({
+            "id": model["id"], "name": model.get("name", model["id"]),
+            "cue_crate_supported": supported,
+            "configured_aliases": [alias for alias, value in defaults.items() if value == model["id"]],
+        })
+    print(json.dumps({
+        "provider": "OpenCode Go", "metadata_only": True,
+        "configured_provider": config.get("provider", DEFAULT_PHOTO_PROVIDER),
+        "models": rows,
+        "note": "Image capability is not an accuracy benchmark. No generation or photo upload was performed.",
+    }, ensure_ascii=False, indent=2))
 
 
 def command_analyse_photos(args: argparse.Namespace) -> None:
-    try:
-        from openai import APIError, APITimeoutError, OpenAI
-    except ImportError:
-        raise SystemExit("Install optional photo support first: python3 -m pip install -r requirements.txt")
-    api_key = read_opencode_go_key(args.api_key_file)
-    if not api_key:
-        raise SystemExit(
-            "No OpenCode Go credential found. Run `opencode auth login` and choose OpenCode Go, "
-            "set OPENCODE_GO_API_KEY, or pass --api-key-file PATH."
-        )
+    if args.resume and args.replace_candidates:
+        raise SystemExit("Choose --resume or --replace-candidates, not both.")
     photo_dir = Path(args.photo_dir).expanduser()
+    if not photo_dir.is_dir():
+        raise SystemExit(f"Photo directory does not exist: {photo_dir}")
     photos = sorted(path for path in photo_dir.iterdir() if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"})
-    existing_paths = set()
     photo_candidates_path = person_workspace_path(args.owner, "photo-candidates.json")
-    if args.resume and photo_candidates_path.exists():
-        result = json.loads(photo_candidates_path.read_text(encoding="utf-8"))
+    if photo_candidates_path.exists() and not args.resume and not args.replace_candidates:
+        raise SystemExit("Existing photo candidates are protected. Use --resume to append new photos, or --replace-candidates to deliberately replace the draft list.")
+    if args.resume:
+        result = load_json(photo_candidates_path, {"generated_at": utc_now(), "owner": args.owner, "photos": []})
         existing_paths = {entry.get("path") for entry in result.get("photos", [])}
         photos = [photo for photo in photos if str(photo) not in existing_paths]
     else:
         result = {"generated_at": utc_now(), "owner": args.owner, "photos": []}
-    if args.limit:
+    if args.limit is not None:
+        if args.limit < 1:
+            raise SystemExit("--limit must be positive.")
         photos = photos[:args.limit]
     if not photos:
-        raise SystemExit(f"No supported photos found in {photo_dir}")
-    client = None
-    if args.provider in {"kimi", "mimo"}:
-        client = OpenAI(api_key=api_key, base_url="https://opencode.ai/zen/go/v1", timeout=90.0, max_retries=0)
-    model = args.model or ("mimo-v2.5" if args.provider == "mimo" else "kimi-k2.6")
+        print("No new supported photos to analyse.")
+        return
+    api_key = read_opencode_go_key(args.api_key_file)
+    if not api_key:
+        raise SystemExit("No OpenCode Go credential found. Install the dedicated cue-crate.opencode-go-api-key Keychain item, set CUE_CRATE_OPENCODE_GO_API_KEY, or pass --api-key-file PATH. See docs/credentials.md.")
+    settings = configured_photo_settings(args)
+    print(f"Using OpenCode Go / {settings['model']} for {len(photos)} photo(s).", flush=True)
     for photo in photos:
-        if args.provider == "minimax":
-            content = minimax_photo_completion(api_key, photo, args.max_tokens)
-            if not content:
-                raise SystemExit(f"MiniMax returned no final JSON for {photo.name}.")
-        else:
-            try:
-                image_size = 1024 if args.provider == "mimo" else 2048
-                completion_args = dict(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": PHOTO_PROMPT},
-                        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_data_url(photo, max_dimension=image_size), "detail": "high"}}]},
-                    ],
-                    temperature=0,
-                    # Kimi may use part of this allowance for reasoning before emitting
-                    # the JSON. Six covers need more room than a single SellBucket item.
-                    max_tokens=args.max_tokens,
-                )
-                if args.provider == "mimo":
-                    completion_args["response_format"] = {"type": "json_object"}
-                response = client.chat.completions.create(**completion_args)
-            except APITimeoutError:
-                raise SystemExit(f"{args.provider.title()} timed out while analysing {photo.name}. No result was saved for that photo; retry later or choose another provider.")
-            except APIError as exc:
-                raise SystemExit(f"{args.provider.title()} could not analyse {photo.name}: {exc}")
-            message = response.choices[0].message
-            if not message.content:
-                finish_reason = response.choices[0].finish_reason
-                raise SystemExit(f"{args.provider.title()} returned no final JSON for {photo.name} (finish reason: {finish_reason}).")
-            content = message.content
-        content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        content = photo_completion(api_key, settings, PHOTO_PROMPT, [
+            {"type": "image_url", "image_url": {"url": image_data_url(photo, max_dimension=settings["max_image_dimension"]), "detail": "high"}},
+        ])
         try:
-            identified = json.loads(content)
+            identified = json.loads(content.removeprefix("```json").removeprefix("```").removesuffix("```").strip())
         except json.JSONDecodeError as exc:
-            raise SystemExit(f"Could not parse analysis for {photo.name}: {exc}")
-        result["photos"].append({"path": str(photo), "records": identified.get("records", [])})
-        ensure_data_dir()
-        photo_candidates_path.parent.mkdir(parents=True, exist_ok=True)
-        photo_candidates_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(f"Analysed {photo.name}: {len(identified.get('records', []))} records found", flush=True)
+            raise SystemExit(f"Could not parse analysis for {photo.name}: {exc}") from exc
+        records = identified.get("records") if isinstance(identified, dict) else None
+        if not isinstance(records, list) or not records or not all(isinstance(record, dict) for record in records):
+            raise SystemExit(f"{photo.name}: the model did not return a non-empty records list. No result was saved.")
+        result["photos"].append({
+            "path": str(photo), "records": records,
+            "analysis_provider": settings["provider"], "analysis_model": settings["model"],
+            "analyzed_at": utc_now(), "max_image_dimension": settings["max_image_dimension"],
+        })
+        result["generated_at"] = utc_now()
+        write_json(photo_candidates_path, result)
+        print(f"Analysed {photo.name}: {len(records)} records found", flush=True)
     print(f"Review candidates at {photo_candidates_path}")
 
 
@@ -3902,6 +5761,8 @@ def parse_model_json(content: str, label: str) -> Dict[str, Any]:
         payload = json.loads(cleaned)
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Could not parse analysis for {label}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"The analysis for {label} did not contain a record object.")
     if isinstance(payload.get("record"), dict):
         payload = payload["record"]
     if isinstance(payload.get("records"), list):
@@ -3912,15 +5773,39 @@ def parse_model_json(content: str, label: str) -> Dict[str, Any]:
 
 
 def command_analyse_intake(args: argparse.Namespace) -> None:
-    try:
-        from openai import APIError, APITimeoutError, OpenAI
-    except ImportError:
-        raise SystemExit("Install optional photo support first: python3 -m pip install -r requirements.txt")
+    if not args.all_pending:
+        if args.limit is not None:
+            raise SystemExit("--limit is used with --all-pending.")
+        analyse_one_intake(args)
+        return
+    if args.upload_id or args.refresh:
+        raise SystemExit("--all-pending cannot be combined with --upload-id or --refresh.")
+    if args.limit is not None and args.limit < 1:
+        raise SystemExit("--limit must be positive.")
+    existing = load_json(person_workspace_path(args.owner, "intake-review.json"), {"items": []})
+    analysed = {item.get("upload_id") for item in existing.get("items", [])}
+    pending = [
+        path.parent.name for path in sorted(person_inbox_dir(args.owner).glob("*/intake.json"))
+        if path.parent.name not in analysed
+    ]
+    if args.limit:
+        pending = pending[:args.limit]
+    if not pending:
+        print("No pending phone bundles. Existing analyses and saved reviews were left unchanged.")
+        return
+    print(f"Analysing {len(pending)} pending phone bundle(s).", flush=True)
+    for upload_id in pending:
+        item_args = argparse.Namespace(**vars(args))
+        item_args.upload_id = upload_id
+        analyse_one_intake(item_args)
+
+
+def analyse_one_intake(args: argparse.Namespace) -> None:
     api_key = read_opencode_go_key(args.api_key_file)
     if not api_key:
         raise SystemExit(
-            "No OpenCode Go credential found. Run `opencode auth login` and choose OpenCode Go, "
-            "set OPENCODE_GO_API_KEY, or pass --api-key-file PATH."
+            "No OpenCode Go credential found. Install the dedicated cue-crate.opencode-go-api-key Keychain item, "
+            "set CUE_CRATE_OPENCODE_GO_API_KEY, or pass --api-key-file PATH. See docs/credentials.md."
         )
     bundle_dir, metadata = intake_bundle_for(args.owner, args.upload_id)
     upload_id = str(metadata.get("upload_id") or bundle_dir.name)
@@ -3941,37 +5826,21 @@ def command_analyse_intake(args: argparse.Namespace) -> None:
     if not views:
         raise SystemExit(f"No supported photos found in intake bundle {upload_id}.")
     primary_path = Path(views.get("evidence") or next(iter(views.values())))
-    client = OpenAI(api_key=api_key, base_url="https://opencode.ai/zen/go/v1", timeout=120.0, max_retries=0)
-    model = args.model or ("mimo-v2.5" if args.provider == "mimo" else "kimi-k2.6")
+    settings = configured_photo_settings(args)
+    model = settings["model"]
     content = [{"type": "text", "text": "These are multiple views of one physical record. Reconcile them into one identification."}]
     for role, path_string in views.items():
         content.append({"type": "text", "text": f"VIEW: {role}"})
-        content.append({"type": "image_url", "image_url": {"url": image_data_url(Path(path_string), max_dimension=1024 if args.provider == "mimo" else 2048), "detail": "high"}})
-    completion_args = {
-        "model": model,
-        "messages": [{"role": "system", "content": INTAKE_PROMPT}, {"role": "user", "content": content}],
-        "temperature": 0,
-        "max_tokens": args.max_tokens,
-    }
-    if args.provider == "mimo":
-        completion_args["response_format"] = {"type": "json_object"}
-    try:
-        response = client.chat.completions.create(**completion_args)
-    except APITimeoutError as exc:
-        raise SystemExit(f"{args.provider.title()} timed out while analysing intake {upload_id}.") from exc
-    except APIError as exc:
-        raise SystemExit(f"{args.provider.title()} could not analyse intake {upload_id}: {exc}") from exc
-    message = response.choices[0].message
-    if not message.content:
-        raise SystemExit(f"{args.provider.title()} returned no final JSON for intake {upload_id}.")
-    observed = parse_model_json(message.content, upload_id)
+        content.append({"type": "image_url", "image_url": {"url": image_data_url(Path(path_string), max_dimension=settings["max_image_dimension"]), "detail": "high"}})
+    observed = parse_model_json(photo_completion(api_key, settings, INTAKE_PROMPT, content), upload_id)
     observed = {field: observed.get(field, "") for field in ("artist", "title", "label", "catalog_number", "barcode", "country", "year", "format", "visible_text", "confidence", "confidence_reason")}
     records = [record for record in load_catalog().get("records", []) if record.get("owner", "").casefold() == args.owner.casefold()]
     candidate = {"position": 1, **observed}
     old = existing.get(item_id, {})
     item = {
         "id": item_id, "upload_id": upload_id, "owner": args.owner, "bundle_path": str(bundle_dir),
-        "views": views, "observed": candidate, "analysis_provider": args.provider, "analysis_model": model,
+        "views": views, "observed": candidate, "analysis_provider": settings["provider"], "analysis_model": model,
+        "max_image_dimension": settings["max_image_dimension"],
         "analyzed_at": utc_now(), "status": old.get("status", "unreviewed"),
         "matched_record_id": old.get("matched_record_id"), "manual_identification": old.get("manual_identification"),
         "discogs_selection": old.get("discogs_selection"), "note": old.get("note", ""),
@@ -3987,7 +5856,7 @@ def command_analyse_intake(args: argparse.Namespace) -> None:
     candidates_path = person_workspace_path(args.owner, "photo-candidates.json")
     candidates = load_json(candidates_path, {"generated_at": utc_now(), "owner": args.owner, "photos": []})
     candidates["photos"] = [photo for photo in candidates.get("photos", []) if photo.get("intake_id") != upload_id]
-    candidates["photos"].append({"path": str(primary_path), "intake_id": upload_id, "views": views, "records": [candidate]})
+    candidates["photos"].append({"path": str(primary_path), "intake_id": upload_id, "views": views, "records": [candidate], "analysis_provider": settings["provider"], "analysis_model": model, "analyzed_at": utc_now()})
     candidates["generated_at"] = utc_now()
     write_json(candidates_path, candidates)
     review = build_review(args.owner)
@@ -4061,6 +5930,14 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_people = commands.add_parser("migrate-person-layout", help="Legacy alias for migrate-profile-layout")
     migrate_people.add_argument("--owner", required=True, help="Configured profile ID or display name that owns the existing local state")
     migrate_people.set_defaults(func=command_migrate_person_layout)
+
+    migrate_identities = commands.add_parser(
+        "migrate-library-identities",
+        help="Relink photo evidence, listening choices, and playlist membership to canonical catalogue records",
+    )
+    migrate_identities.add_argument("--owner", required=True, help="Configured profile ID or display name to migrate")
+    migrate_identities.add_argument("--apply", action="store_true", help="Write the migration after creating a local rollback backup; omitted is a dry run")
+    migrate_identities.set_defaults(func=command_migrate_library_identities)
 
     location = commands.add_parser("set-record-location", help="Place one owned physical copy in or out of a shared crate/bin")
     location.add_argument("--owner", required=True, help="Configured person ID or display name that owns the physical copy")
@@ -4183,24 +6060,34 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_bpm.add_argument("--refresh", action="store_true", help="Recheck tracks even when they already have provider metadata")
     enrich_bpm.set_defaults(func=command_enrich_bpm)
 
+    photo_models = commands.add_parser("photo-models", help="List current Go image models without uploading photos or running generation")
+    photo_models.add_argument("--refresh", action="store_true", help="Refresh the public model catalog instead of using the 24-hour cache")
+    photo_models.add_argument("--photo-config", help="Optional photo-analysis settings JSON; defaults to config/photo-analysis.local.json")
+    photo_models.set_defaults(func=command_photo_models)
+
     photos = commands.add_parser("analyse-photos", help="Create review-only drafts from multi-record photos")
     photos.add_argument("--owner", required=True)
     photos.add_argument("--photo-dir", required=True, help="Folder containing the six-record photos")
-    photos.add_argument("--provider", choices=["kimi", "mimo", "minimax"], default="kimi")
+    photos.add_argument("--provider", choices=list(DEFAULT_MODELS), help="Go model family; omitted uses photo settings or MiMo")
     photos.add_argument("--model", help="Override the provider's default model ID")
     photos.add_argument("--api-key-file", help="Read the OpenCode Go API key from this local file; omitted uses env/config/OpenCode auth")
-    photos.add_argument("--max-tokens", type=int, default=4096)
+    photos.add_argument("--photo-config", help="Optional photo-analysis settings JSON")
+    photos.add_argument("--max-tokens", type=int, help="Output/reasoning allowance; default 8192 or local photo settings")
     photos.add_argument("--limit", type=int, help="Analyse only the first N photos (useful for a trial run)")
     photos.add_argument("--resume", action="store_true", help="Skip photo grids already saved in this person's workspace")
+    photos.add_argument("--replace-candidates", action="store_true", help="Explicitly replace the draft photo list instead of protecting existing candidates")
     photos.set_defaults(func=command_analyse_photos)
 
     intake = commands.add_parser("analyse-intake", help="Analyse one phone-uploaded record bundle as a single physical record")
     intake.add_argument("--owner", required=True)
     intake.add_argument("--upload-id", help="Specific mobile upload ID; omitted uses the most recent bundle")
-    intake.add_argument("--provider", choices=["kimi", "mimo"], default="kimi")
+    intake.add_argument("--provider", choices=list(DEFAULT_MODELS), help="Go model family; omitted uses photo settings or MiMo")
     intake.add_argument("--model", help="Override the provider's default model ID")
     intake.add_argument("--api-key-file", help="Read the OpenCode Go API key from this local file; omitted uses env/config/OpenCode auth")
-    intake.add_argument("--max-tokens", type=int, default=2048)
+    intake.add_argument("--photo-config", help="Optional photo-analysis settings JSON")
+    intake.add_argument("--max-tokens", type=int, help="Output/reasoning allowance; default 8192 or local photo settings")
+    intake.add_argument("--all-pending", action="store_true", help="Analyse only phone bundles with no saved intake analysis")
+    intake.add_argument("--limit", type=int, help="Analyse at most N pending bundles")
     intake.add_argument("--refresh", action="store_true", help="Reanalyse a bundle that already has an intake result")
     intake.set_defaults(func=command_analyse_intake)
 

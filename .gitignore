@@ -3,10 +3,22 @@
 __pycache__/
 *.py[cod]
 .env
+.env.*
+!.env.example
+!.env.*.example
 client_secret*.json
-config/people.local.json
-config/profiles.local.json
-config/collectives.local.json
+credentials*.json
+*-oauth.json
+token.json
+tokens.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+config/*.local.json
+!config/*.example.json
 imports/
 
 # Personal collection data, API responses, generated reports, and review state.

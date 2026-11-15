@@ -35,10 +35,17 @@ The source of truth is `app.css`.
 - **Type**: serif display titles, system sans-serif interface text, and monospaced factual
   metadata. This makes titles expressive and pressing/BPM/key data fast to scan.
 - **Shape**: 8px, 14px, and 22px radii only. Borders carry grouping; elevation is subtle.
+- **Spacing**: use the 4, 8, 12, 16, 24, and 32px scale for new layout work.
+- **Controls**: text fields and primary buttons share a 44px height. Checkbox, radio,
+  and range inputs have their own styles, never the boxed text-field treatment.
 
 ## Component rules
 
 - `surface`: framed workspace, toolbar, report card, or playlist item.
+- `surface--raised`: elevation reserved for a primary workspace, not every nested panel.
+- `control-field`: a visible label and its full-width control.
+- `field-action-row`: a flexible input plus an intrinsically sized action; use
+  `input-pair` only for two peer fields.
 - `record-card`: cover-led library browsing. Do not add more than two metadata lines.
 - `record-row`: dense quick-crate or list-mode entry.
 - `chip`: ownership, scope, or compact neutral metadata.
@@ -53,6 +60,14 @@ Desktop uses a centred page shell with a horizontal navigation bar. Below 820px,
 navigation becomes a fixed bottom bar, cover grids become two columns, and review work
 flows stack into a deliberate single-column sequence. Controls should not rely on hover,
 drag, or dense tables to remain usable.
+
+Review and Playlist workbenches switch their outer layout below 960px. Their inner
+columns also respond to container width, so a sidebar cannot force cramped fields.
+Dense pressing tables retain readable columns and scroll inside the result card;
+they must never force horizontal page scrolling.
+
+Page anatomy is header → toolbar → workspace. Keep filters out of display headers.
+Separate local Save actions, external publishing, and destructive actions.
 
 ## Accessibility baseline
 
